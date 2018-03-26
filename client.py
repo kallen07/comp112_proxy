@@ -18,7 +18,6 @@ class HTTPRequest(BaseHTTPRequestHandler):
         self.error_message = message
 
 def main():
-
     MAX_HEADER_BYTES = 8000
 
     serverSocket = socket(AF_INET, SOCK_STREAM)
@@ -28,27 +27,31 @@ def main():
     serverSocket.bind(server_address)
     serverSocket.listen(1)
     serverSocket.settimeout(60)
+    # accept new socket connections
     while True:
-        print >>sys.stderr, 'waiting for a connection'
+        print >>sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
 
-        try:
-            print >> sys.stderr, 'connection from', client_address
-            data = connection.recv(MAX_HEADER_BYTES)
-            request = HTTPRequest(data)
-            print >> sys.stderr, 'received "%s"' % data
-            if data:
-                #print >>sys.stderr, 'received data: %s' % data
-                response = get_response_from_server(request)
-                send_reponse_to_client(response, connection)
-                # connection.sendall(ABOUT_ME)
-            else:
-                print >> sys.stderr, 'no more data from', client_address
+        # accept new requests from a connection
+        while True:
+            try:
+                print >> sys.stderr, '=================== connection from', client_address, '==================='
+                data = connection.recv(MAX_HEADER_BYTES)
+                request = HTTPRequest(data)
+                print >> sys.stderr, 'received "%s"' % data
+                if data:
+                    #print >>sys.stderr, 'received data: %s' % data
+                    response = get_response_from_server(request)
+                    send_reponse_to_client(response, connection)
+                    # connection.sendall(ABOUT_ME)
+                else:
+                    print >> sys.stderr, 'no more data from', client_address
+                    break
+            except:
+                # print("Unexpected error:", sys.exc_info()[0])
+                print >> sys.stderr, '=================== CLOSING SOCKET =================='
+                connection.close()
                 break
-        finally:
-            # Clean up the connection
-            connection.close()
-
 
 
 ################### CLIENT #######################
@@ -67,13 +70,11 @@ def send_reponse_to_client(response, connection):
         '1.0', str(response.status), response.reason,
         '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
     ))
-    #print formatted_res
     connection.sendall(formatted_res)
 
 
 ################### SERVER #######################
 def get_response_from_server(request):
-    print >> sys.stderr, "attempting to connect to server"
     hostname = request.headers["host"]
     conn = httplib.HTTPConnection(hostname)
     conn.request("GET",request.path.split(hostname)[1])
