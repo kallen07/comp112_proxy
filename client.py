@@ -1,10 +1,10 @@
 from socket import *
 import sys
-
 from BaseHTTPServer import BaseHTTPRequestHandler
 from StringIO import StringIO
-
 import httplib
+
+MAX_HEADER_BYTES = 8000
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -17,44 +17,50 @@ class HTTPRequest(BaseHTTPRequestHandler):
         self.error_code = code
         self.error_message = message
 
-def main():
-    MAX_HEADER_BYTES = 8000
 
+################### MAIN #######################
+def main():
+    port = int(sys.argv[1])
+
+    # create master socket
     serverSocket = socket(AF_INET, SOCK_STREAM)
-    server_address = ('localhost', 8080)
-    print >>sys.stderr, 'starting up on %s port %s' % server_address
+    server_address = ('localhost', port)
+    print >> sys.stderr, 'starting up on %s port %s' % server_address
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
     serverSocket.listen(1)
     serverSocket.settimeout(60)
+
     # accept new socket connections
     while True:
-        print >>sys.stderr, '=================== waiting for a connection =================='
+        print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
+        handle_client_request(connection, client_address)
 
-        # accept new requests from a connection
-        while True:
-            try:
-                print >> sys.stderr, '=================== connection from', client_address, '==================='
-                data = connection.recv(MAX_HEADER_BYTES)
-                request = HTTPRequest(data)
-                print >> sys.stderr, 'received "%s"' % data
-                if data:
-                    #print >>sys.stderr, 'received data: %s' % data
-                    response = get_response_from_server(request)
-                    send_reponse_to_client(response, connection)
-                    # connection.sendall(ABOUT_ME)
-                else:
-                    print >> sys.stderr, 'no more data from', client_address
-                    break
-            except:
-                # print("Unexpected error:", sys.exc_info()[0])
-                print >> sys.stderr, '=================== CLOSING SOCKET =================='
-                connection.close()
-                break
 
 
 ################### CLIENT #######################
+def handle_client_request(connection, client_address):
+    # accept new requests from a connection
+    #while True:
+    try:
+        print >> sys.stderr, '=================== connection from', client_address, '==================='
+        data = connection.recv(MAX_HEADER_BYTES)
+        request = HTTPRequest(data)
+        print >> sys.stderr, 'received "%s"' % data
+        if data:
+            response = get_response_from_server(request)
+            send_reponse_to_client(response, connection)
+        else:
+            print >> sys.stderr, 'no more data from', client_address
+            #break
+    except:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
+        print >> sys.stderr, '=================== CLOSING SOCKET =================='
+        connection.close()
+        #break
+
+        
 def send_reponse_to_client(response, connection):
     headers = response.getheaders()
     #headers.append(("Content-Length", ""))
@@ -73,6 +79,7 @@ def send_reponse_to_client(response, connection):
     connection.sendall(formatted_res)
 
 
+
 ################### SERVER #######################
 def get_response_from_server(request):
     hostname = request.headers["host"]
@@ -80,6 +87,7 @@ def get_response_from_server(request):
     conn.request("GET",request.path.split(hostname)[1])
     res = conn.getresponse()
     return res
+
 
 if __name__ == "__main__":
     main()
