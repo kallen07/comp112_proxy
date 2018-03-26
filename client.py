@@ -35,6 +35,7 @@ def main():
         print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
         connection.settimeout(1)
+        # TODO call this function in a new thread
         handle_client_request(connection, client_address)
 
 
@@ -42,23 +43,24 @@ def main():
 ################### CLIENT #######################
 def handle_client_request(connection, client_address):
     # accept new requests from a connection
-    #while True:
-    try:
-        print >> sys.stderr, '=================== connection from', client_address, '==================='
-        data = connection.recv(MAX_HEADER_BYTES)
-        request = HTTPRequest(data)
-        print >> sys.stderr, 'received "%s"' % data
-        if data:
-            response = get_response_from_server(request)
-            send_reponse_to_client(response, connection)
-        else:
-            print >> sys.stderr, 'no more data from', client_address
-            #break
-    except:
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
-        print >> sys.stderr, '=================== CLOSING SOCKET =================='
-        connection.close()
-        #break
+    # TODO determine if we need this while True loop
+    while True:
+        try:
+            print >> sys.stderr, '=================== connection from', client_address, '==================='
+            data = connection.recv(MAX_HEADER_BYTES)
+            request = HTTPRequest(data)
+            print >> sys.stderr, 'received "%s"' % data
+            if data:
+                response = get_response_from_server(request)
+                send_reponse_to_client(response, connection)
+            else:
+                print >> sys.stderr, 'no more data from', client_address
+                break
+        except:
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
+            print >> sys.stderr, '=================== CLOSING SOCKET =================='
+            connection.close()
+            break
 
         
 def send_reponse_to_client(response, connection):
@@ -66,6 +68,7 @@ def send_reponse_to_client(response, connection):
     #headers.append(("Content-Length", ""))
 
     #'1.0' if response.version is 10 else '1.1'
+    # TODO update HTML version so it isn't hardcoded as 1.0
     formatted_res = 'HTTP/{} {} {}\r\n{}\r\n\r\n{}'.format(
         '1.0', str(response.status), response.reason,
         '\r\n'.join('{}: {}'.format(k, v) for k, v in headers),
@@ -86,6 +89,7 @@ def get_response_from_server(request):
     conn = httplib.HTTPConnection(hostname)
     conn.request("GET",request.path.split(hostname)[1])
     res = conn.getresponse()
+    # TODO close this connection or reuse it
     return res
 
 
