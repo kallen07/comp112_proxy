@@ -29,12 +29,12 @@ def main():
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
     serverSocket.listen(1)
-    serverSocket.settimeout(60)
 
     # accept new socket connections
     while True:
         print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
+        connection.settimeout(1)
         handle_client_request(connection, client_address)
 
 
