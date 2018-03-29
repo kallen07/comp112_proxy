@@ -4,8 +4,12 @@ from BaseHTTPServer import BaseHTTPRequestHandler
 from StringIO import StringIO
 import httplib
 import traceback
+from threading import Thread
+import Queue
 
 MAX_HEADER_BYTES = 8000
+MAX_NUM_THREADS = 10
+requests = Queue.Queue()
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -38,15 +42,29 @@ def main():
     serverSocket.bind(server_address)
     serverSocket.listen(1)
 
+    # create thread pool
+    threads = []
+    for i in xrange(MAX_NUM_THREADS):
+	t = Thread(target = consumer_thread, args = [i])
+        threads.append(t)
+        t.start()
+
     # accept new socket connections
     while True:
         print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
         print >> sys.stderr, '=================== new connection from', client_address, '==================='
         connection.settimeout(5)
-        # TODO call this function in a new thread
-        handle_client_request(connection, client_address)
+        connection.settimeout(1)
+	requests.put((connection, client_address))
+	
 
+#################### THREADING ###################
+def consumer_thread(id):
+     while True:
+        request = requests.get()
+        handle_client_request(*request)
+        print "about to sleep, on thread", id
 
 
 ################### CLIENT #######################
