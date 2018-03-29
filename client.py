@@ -3,6 +3,7 @@ import sys
 from BaseHTTPServer import BaseHTTPRequestHandler
 from StringIO import StringIO
 import httplib
+import traceback
 
 MAX_HEADER_BYTES = 8000
 
@@ -12,6 +13,13 @@ class HTTPRequest(BaseHTTPRequestHandler):
         self.raw_requestline = self.rfile.readline()
         self.error_code = self.error_message = None
         self.parse_request()
+        self.body = None
+        # TODO Find a better way to tell if there is a body to parse. So far
+        # I only see POST and PUT as having bodies. Are these definitely the
+        # only two?
+        if self.command == 'POST' or self.command == 'PUT':
+            content_len = int(self.headers.getheader('content-length', 0))
+            self.body = self.rfile.read(content_len)
 
     def send_error(self, code, message):
         self.error_code = code
@@ -34,7 +42,8 @@ def main():
     while True:
         print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
-        connection.settimeout(1)
+        print >> sys.stderr, '=================== new connection from', client_address, '==================='
+        connection.settimeout(5)
         # TODO call this function in a new thread
         handle_client_request(connection, client_address)
 
@@ -46,7 +55,7 @@ def handle_client_request(connection, client_address):
     # TODO determine if we need this while True loop
     while True:
         try:
-            print >> sys.stderr, '=================== connection from', client_address, '==================='
+            print >> sys.stderr, '=================== reading from', client_address, '==================='
             data = connection.recv(MAX_HEADER_BYTES)
             request = HTTPRequest(data)
             print >> sys.stderr, 'received "%s"' % data
@@ -58,6 +67,7 @@ def handle_client_request(connection, client_address):
                 break
         except:
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
+            print traceback.print_tb(sys.exc_info()[2])
             print >> sys.stderr, '=================== CLOSING SOCKET =================='
             connection.close()
             break
@@ -86,9 +96,21 @@ def send_reponse_to_client(response, connection):
 ################### SERVER #######################
 def get_response_from_server(request):
     hostname = request.headers["host"]
+    print "***************************************"
+    print request.command
+    if request.body:
+        print request.body
+    print "***************************************"
+
     conn = httplib.HTTPConnection(hostname)
-    conn.request("GET",request.path.split(hostname)[1])
+
+    # NEEDSWORK: Chrome does not allow cookies to be set by localhost. Logins will not work
+    if request.body:
+        conn.request(request.command, request.path.split(hostname)[1], body=request.body, headers=dict(request.headers))
+    else:
+        conn.request(request.command, request.path.split(hostname)[1], headers=dict(request.headers))
     res = conn.getresponse()
+
     # TODO close this connection or reuse it
     return res
 
