@@ -6,10 +6,27 @@ import httplib
 import traceback
 from threading import Thread
 import Queue
+import token_bucket
+from collections import defaultdict
 
 MAX_HEADER_BYTES = 8000
 MAX_NUM_THREADS = 10
 requests = Queue.Queue()
+# From documentation: 
+# rate: Number of tokens per second to add to the
+#   bucket. Over time, the number of tokens that can be
+#   consumed is limited by this rate. Each token represents
+#   some percentage of a finite resource that may be
+#   utilized by a consumer.
+# capacity: Maximum number of tokens that the bucket
+#   can hold. Once the bucket is full, additional tokens
+#   are discarded.
+
+# Rate and capacity units: number of requests (per client)
+rate = 100
+capacity = 500
+storage = token_bucket.MemoryStorage()
+limiter = token_bucket.Limiter(rate, capacity, storage)
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -45,7 +62,7 @@ def main():
     # create thread pool
     threads = []
     for i in xrange(MAX_NUM_THREADS):
-	t = Thread(target = consumer_thread, args = [i])
+        t = Thread(target = consumer_thread, args = [i])
         threads.append(t)
         t.start()
 
@@ -55,16 +72,18 @@ def main():
         connection, client_address = serverSocket.accept()
         print >> sys.stderr, '=================== new connection from', client_address, '==================='
         connection.settimeout(5)
-        connection.settimeout(1)
-	requests.put((connection, client_address))
-	
+        requests.put((connection, client_address))
+    
 
 #################### THREADING ###################
 def consumer_thread(id):
-     while True:
+    while True:
         request = requests.get()
+        print "on thread", id, "client:", request[1]
+        # Key is client address
+        limiter.consume(request[1])
         handle_client_request(*request)
-        print "about to sleep, on thread", id
+        
 
 
 ################### CLIENT #######################
@@ -86,6 +105,7 @@ def handle_client_request(connection, client_address):
         except:
             print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
             print traceback.print_tb(sys.exc_info()[2])
+            # if sys.exc_info
             print >> sys.stderr, '=================== CLOSING SOCKET =================='
             connection.close()
             break
@@ -114,11 +134,11 @@ def send_reponse_to_client(response, connection):
 ################### SERVER #######################
 def get_response_from_server(request):
     hostname = request.headers["host"]
-    print "***************************************"
-    print request.command
-    if request.body:
-        print request.body
-    print "***************************************"
+    # print "***************************************"
+    # print request.command
+    # if request.body:
+    #     print request.body
+    # print "***************************************"
 
     conn = httplib.HTTPConnection(hostname)
 
