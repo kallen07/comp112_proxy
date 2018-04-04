@@ -1,0 +1,55 @@
+('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:', (<class 'socket.error'>, error(10060, 'A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond'), <traceback object at 0x0000000005E7EB48>))
+  File "client.py", line 125, in handle_client_request
+    response = get_response_from_server(request)
+  File "client.py", line 174, in get_response_from_server
+    conn.request(request.command, request.path.split(hostname)[1], headers=dict(request.headers))
+  File "C:\Python27\lib\httplib.py", line 1042, in request
+    self._send_request(method, url, body, headers)
+  File "C:\Python27\lib\httplib.py", line 1082, in _send_request
+    self.endheaders(body)
+  File "C:\Python27\lib\httplib.py", line 1038, in endheaders
+    self._send_output(message_body)
+  File "C:\Python27\lib\httplib.py", line 882, in _send_output
+    self.send(msg)
+  File "C:\Python27\lib\httplib.py", line 844, in send
+    self.connect()
+  File "C:\Python27\lib\httplib.py", line 821, in connect
+    self.timeout, self.source_address)
+  File "C:\Python27\lib\socket.py", line 575, in create_connection
+    raise err
+None
+
+
+('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:', (<class 'httplib.BadStatusLine'>, BadStatusLine("''",), <traceback object at 0x0000000005E94A48>))
+  File "client.py", line 125, in handle_client_request
+    response = get_response_from_server(request)
+  File "client.py", line 175, in get_response_from_server
+    res = conn.getresponse()
+  File "C:\Python27\lib\httplib.py", line 1121, in getresponse
+    response.begin()
+  File "C:\Python27\lib\httplib.py", line 438, in begin
+    version, status, reason = self._read_status()
+  File "C:\Python27\lib\httplib.py", line 402, in _read_status
+    raise BadStatusLine(line)
+None 
+
+('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:', (<class 'socket.gaierror'>, gaierror(11001, 'getaddrinfo failed'), <traceback object at 0x000000000617EE48>))
+  File "client.py", line 125, in handle_client_request
+    response = get_response_from_server(request)
+  File "client.py", line 212, in get_response_from_server
+    conn.request(request.command, request.path.split(hostname)[1], headers=dict(request.headers))
+  File "C:\Python27\lib\httplib.py", line 1042, in request
+    self._send_request(method, url, body, headers)
+  File "C:\Python27\lib\httplib.py", line 1082, in _send_request
+    self.endheaders(body)
+  File "C:\Python27\lib\httplib.py", line 1038, in endheaders
+    self._send_output(message_body)
+  File "C:\Python27\lib\httplib.py", line 882, in _send_output
+    self.send(msg)
+  File "C:\Python27\lib\httplib.py", line 844, in send
+    self.connect()
+  File "C:\Python27\lib\httplib.py", line 821, in connect
+    self.timeout, self.source_address)
+  File "C:\Python27\lib\socket.py", line 557, in create_connection
+    for res in getaddrinfo(host, port, 0, SOCK_STREAM):
+None
