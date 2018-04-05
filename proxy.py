@@ -9,6 +9,7 @@ from threading import Lock
 import Queue
 import token_bucket
 import argparse
+import logging
 from datetime import datetime, timedelta
 
 
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 ###############################################################################
 
 # max number of bytes that can be in an HTTP header
+# NEEDSWORK: Can this cover requests with bodies? (eg POST)
 MAX_HEADER_BYTES = 8000
 # number of threads to handle requests
 MAX_NUM_THREADS = 20
@@ -31,7 +33,7 @@ REUSE_SERVER_CONNECTIONS = True
 #   key: hostname
 #   value: [(connection, TTL)]
 # value cannot be an empty list - if the key exists then there must be at least
-# one available xonnection
+# one available connection
 # TTL specifies when to close the connection
 server_connections = dict()
 # ALWAYS use servers_lock when accessing the server_connections dict
@@ -56,6 +58,9 @@ limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 # Choosing the verbose option prints every debug statement. Otherwise,
 # only major ones are printed
 VERBOSE = False
+
+logging.basicConfig(level=logging.DEBUG,
+                    format='[%(levelname)s] (%(threadName)-9s) %(message)s',)
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -101,7 +106,7 @@ def main():
     # TODO: Test server_address arg with non-localhost option
     server_address = (args.server_address, port)
 
-    print >> sys.stderr, 'starting up on %s port %s' % server_address
+    logging.debug('starting up on %s port %s' % server_address)
 
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
@@ -117,13 +122,12 @@ def main():
 
     # accept new socket connections
     while True:
-        if VERBOSE: print >> sys.stderr, '=================== waiting for a connection =================='
+        if VERBOSE: logging.debug('=================== waiting for a connection ==================')
         connection, client_address = serverSocket.accept()
-        print >> sys.stderr, '=================== new connection from', client_address, '==================='
+        logging.debug('=================== new connection from %s ===================' % str(client_address))
         connection.settimeout(5)
         requests.put((connection, client_address))
     
-
 
 ###############################################################################
 #                                 THREADING                                   #
@@ -134,8 +138,6 @@ def consumer_thread(id):
         #print "on thread", id, "client:", request[1]
         # Key is client address
         handle_client_request(*request)
-        
-
 
 # TODO (kalina) make a thread
 def prune_server_connections_dict():
@@ -159,42 +161,44 @@ def send_rate_limiting_error(connection, client_address, request):
         'Content-Type: text/html',
         html_body
     )
-    if VERBOSE: print >> sys.stderr, formatted_res
+    if VERBOSE: logging.debug(formatted_res)
     connection.sendall(formatted_res)
-
 
 def handle_client_request(connection, client_address):
     # accept new requests from a connection
     # TODO determine if we need this while True loop
     while True:
         try:
-            if VERBOSE: print >> sys.stderr, '=================== reading from', client_address, '==================='
-            else: print >> sys.stderr, "Reading from", client_address
+            if VERBOSE: logging.debug('=================== reading from %s ===================' % str(client_address))
+            else: logging.debug("Reading from %s" % client_address)
 
             data = connection.recv(MAX_HEADER_BYTES)
             request = HTTPRequest(data)
-            if VERBOSE: print >> sys.stderr, 'received "%s"' % data
+            if VERBOSE: logging.debug('received "%s"' % data)
             if data:
                 # Key is client address
                 success = limiter.consume(client_address)
-                if VERBOSE: print "CONSUMED TOKEN" if success else "COULD NOT CONSUME TOKEN"
+                if VERBOSE: logging.debug("CONSUMED TOKEN" if success else "COULD NOT CONSUME TOKEN")
                 if not success:
-                    print >> sys.stderr, "Client", client_address, "is being rate limited"
+                    logging.debug("Client %s is being rate limited" % client_address)
                     send_rate_limiting_error(connection, client_address, request)
                     # TODO: close connection here
                     break
                 response = get_response_from_server(request)
                 send_response_to_client(response, connection)
             else:
-                print >> sys.stderr, 'no more data from', client_address
+                logging.debug('no more data from %s' % str(client_address))
                 break
         except (KeyboardInterrupt, SystemExit):
-            if VERBOSE: print >> sys.stderr, "Received KeyboardInterrupt or SystemExit, exiting now"
+            if VERBOSE: logging.debug("Received KeyboardInterrupt or SystemExit, exiting now")
             sys.exit()
         except:
-            print >> sys.stderr, "********** Caught exception:", sys.exc_info()
-            if VERBOSE: print >> sys.stderr, traceback.print_tb(sys.exc_info()[2])
-            print >> sys.stderr, '=================== CLOSING SOCKET =================='
+            logging.debug( "********** Caught exception: %s for client %s" % (str(sys.exc_info()), str(client_address)))
+            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+            if 'BadStatusLine' in str(sys.exc_info()[1]):
+                logging.debug("Reraising bad status line...")
+                raise
+            logging.debug('=================== CLOSING SOCKET ==================')
             connection.close()
             break
 
@@ -203,18 +207,19 @@ def send_response_to_client(response, connection):
     headers = response.getheaders()
     http_version = '1.0' if response.version is 10 else '1.1'
 
+
     formatted_header = 'HTTP/{} {} {}\r\n{}\r\n\r\n'.format(
         http_version, str(response.status), response.reason,
         '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
     )
-    if VERBOSE: print >> sys.stderr, "Sending headers"
+    if VERBOSE: logging.debug("Sending headers")
     connection.sendall(formatted_header)
-    if VERBOSE: print >> sys.stderr, formatted_header
+    if VERBOSE: logging.debug(formatted_header)
 
     # Chunked responses are forwarded using the approach found here:
     # https://stackoverflow.com/questions/24500752/how-can-i-read-exactly-one-response-chunk-with-pythons-http-client
     if response.getheader('transfer-encoding', '').lower() == 'chunked':
-        if VERBOSE: print >> sys.stderr, "Sending chunked body"
+        if VERBOSE: logging.debug("Sending chunked body")
 
         def send_chunk_size():
             # size_str will contain the size of the current chunk in hex
@@ -222,7 +227,7 @@ def send_response_to_client(response, connection):
             while size_str[-2:] != b"\r\n":
                 size_str += response.read(1)
 
-            if VERBOSE: print >> sys.stderr, "chunk size:", size_str[:-2], "(", int(size_str[:-2], 16), ")"
+            if VERBOSE: logging.debug("chunk size: %s (%d) " % (size_str[:-2], int(size_str[:-2], 16)))
 
             # adds hex string plus \r\n delimeter to body
             connection.sendall(size_str)
@@ -237,22 +242,23 @@ def send_response_to_client(response, connection):
             # eventual retries? Or maybe just manually add the delimeter? Not sure what
             # the best approach is.
             if data[-2:] != b"\r\n":
-                print >> sys.stderr, "ERROR: Chunk did not end in newline-carriage return"
+               logging.debug("ERROR: Chunk did not end in newline-carriage return")
             connection.sendall(data)
 
         while True:
             chunk_size = send_chunk_size()
 
             if (chunk_size == 0):
-                if VERBOSE: print >> sys.stderr, "Sending terminating chunk"
-                connection.sendall(b"\r\n")
+                if VERBOSE: logging.debug("Sending terminating chunk")
+                # Sends the terminating \r\n and completes read of response
+                connection.sendall(response.read(2))
                 break
             else:
-                if VERBOSE: print >> sys.stderr, "Sending chunk of size", chunk_size
+                if VERBOSE: logging.debug("Sending chunk of size %d " % chunk_size)
                 send_chunk_data(chunk_size)
 
     else:
-        if VERBOSE: print >> sys.stderr, "Reading response in one go (not chunked)"
+        if VERBOSE: logging.debug("Reading response in one go (not chunked)")
         connection.sendall(response.read())
 
 
@@ -270,16 +276,20 @@ def acquire_server_connection(hostname):
                     server_connections[hostname] = connections
                 return conn
 
+    # TODO starting TTL should be greater than current time
     return (httplib.HTTPConnection(hostname), datetime.now())
 
 def release_server_connection(hostname, conn, TTL):
     if REUSE_SERVER_CONNECTIONS:
         # increase time to keep the connection open
         TTL = TTL + timedelta(seconds=5)
+        if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (conn, hostname, TTL))
         with servers_lock:
             if hostname in server_connections:
+                if VERBOSE: logging.debug("There were already %d connections for this host" % (len(server_connections[hostname])))
                 server_connections[hostname].append((conn, TTL))
             else:
+                if VERBOSE: logging.debug("This is the only connection right now for this host")
                 server_connections[hostname] = [(conn, TTL)]
     else:
         pass # TODO CLOSE CONNECTION?
@@ -287,8 +297,10 @@ def release_server_connection(hostname, conn, TTL):
 def get_response_from_server(request):
     hostname = request.headers["host"]
 
-    conn, TTYL = acquire_server_connection(hostname)
-    print >> sys.stderr, "Connecting to server with hostname", hostname
+    logging.debug("Connecting to server with hostname %s" % hostname)
+    conn, TTL = acquire_server_connection(hostname)
+    if VERBOSE: logging.debug("Using connection %s (TTL: %s)" % (conn, TTL))
+    
 
     # TODO: Chrome does not allow cookies to be set by localhost. Logins will not work with chrome.
     # TODO: Cookies seem to be acting up in Firefox too. I get logged out after a couple of page
@@ -301,7 +313,7 @@ def get_response_from_server(request):
     res = conn.getresponse()
     # TODO: Flash(?) games don't seem to load properly. (Go to neopets->Game Room, and click on any game.)
 
-    release_server_connection(hostname, conn, TTYL)
+    release_server_connection(hostname, conn, TTL)
 
     # Response is marked as not being chunked to allow us to send the chunks
     # correctly later on
