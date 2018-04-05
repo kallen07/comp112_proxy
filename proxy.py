@@ -5,14 +5,38 @@ from StringIO import StringIO
 import httplib
 import traceback
 from threading import Thread
+from threading import Lock
 import Queue
 import token_bucket
-from requests.models import Response
+from datetime import datetime, timedelta
 
+
+###############################################################################
+#                          CONSTANTS & GLOBALS                                #
+###############################################################################
+
+# max number of bytes that can be in an HTTP header
 MAX_HEADER_BYTES = 8000
-MAX_NUM_THREADS = 10
+# number of threads to handle requests
+MAX_NUM_THREADS = 20
+
+# list of requests to be handled
+# items in the queue are tuples: (connection, client_address)
 requests = Queue.Queue()
-# From documentation: 
+
+# determine if we should reuse server connections across different requests
+REUSE_SERVER_CONNECTIONS = True
+# list of open socket connections to reuse when connecting to the server
+#   key: hostname
+#   value: [(connection, TTL)]
+# value cannot be an empty list - if the key exists then there must be at least
+# one available xonnection
+# TTL specifies when to close the connection
+server_connections = dict()
+# ALWAYS use servers_lock when accessing the server_connections dict
+servers_lock = Lock()
+
+# rate limiting mechanism (token bucket algo)
 # rate: Number of tokens per second to add to the
 #   bucket. Over time, the number of tokens that can be
 #   consumed is limited by this rate. Each token represents
@@ -47,7 +71,10 @@ class HTTPRequest(BaseHTTPRequestHandler):
         self.error_message = message
 
 
-################### MAIN #######################
+###############################################################################
+#                                   MAIN                                      #
+###############################################################################
+
 def main():
     port = int(sys.argv[1])
 
@@ -75,7 +102,10 @@ def main():
         requests.put((connection, client_address))
     
 
-#################### THREADING ###################
+
+###############################################################################
+#                                 THREADING                                   #
+###############################################################################
 def consumer_thread(id):
     while True:
         request = requests.get()
@@ -85,7 +115,14 @@ def consumer_thread(id):
         
 
 
-################### CLIENT #######################
+# TODO (kalina) make a thread
+def prune_server_connections_dict():
+    pass
+
+
+###############################################################################
+#                          CLIENT INTERACTIONS                                #
+###############################################################################
 def send_rate_limiting_error(connection, client_address, request):
     # sends an error message indicating the client is being
     # rate limited
@@ -136,8 +173,6 @@ def handle_client_request(connection, client_address):
             break
 
 
-
-        
 def send_response_to_client(response, connection):
     headers = response.getheaders()
     http_version = '1.0' if response.version is 10 else '1.1'
@@ -195,12 +230,38 @@ def send_response_to_client(response, connection):
         connection.sendall(response.read())
 
 
+###############################################################################
+#                          SERVER INTERACTIONS                                #
+###############################################################################
 
-################### SERVER #######################
+def acquire_server_connection(hostname):
+    if REUSE_SERVER_CONNECTIONS:
+        with servers_lock:
+            connections = server_connections.pop(hostname, None)
+            if connections is not None:
+                conn = connections.pop()
+                if connections:
+                    server_connections[hostname] = connections
+                return conn
+
+    return (httplib.HTTPConnection(hostname), datetime.now())
+
+def release_server_connection(hostname, conn, TTL):
+    if REUSE_SERVER_CONNECTIONS:
+        # increase time to keep the connection open
+        TTL = TTL + timedelta(seconds=5)
+        with servers_lock:
+            if hostname in server_connections:
+                server_connections[hostname].append((conn, TTL))
+            else:
+                server_connections[hostname] = [(conn, TTL)]
+    else:
+        pass # TODO CLOSE CONNECTION?
+
 def get_response_from_server(request):
     hostname = request.headers["host"]
 
-    conn = httplib.HTTPConnection(hostname)
+    conn, TTYL = acquire_server_connection(hostname)
     print >> sys.stderr, "Got connection to server"
 
     # TODO: Chrome does not allow cookies to be set by localhost. Logins will not work with chrome.
@@ -213,6 +274,8 @@ def get_response_from_server(request):
 
     res = conn.getresponse()
     # TODO: Flash(?) games don't seem to load properly. (Go to neopets->Game Room, and click on any game.)
+
+    release_server_connection(hostname, conn, TTYL)
 
     # Response is marked as not being chunked to allow us to send the chunks
     # correctly later on
