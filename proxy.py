@@ -269,6 +269,11 @@ def send_response_to_client(response, connection):
                 if VERBOSE: logging.debug("Sending terminating chunk")
                 # Sends the terminating \r\n and completes read of response
                 connection.sendall(response.read(2))
+                
+                # Check that there is nothing left to read
+                flushed_contents = response.read(MAX_HEADER_BYTES)
+                if flushed_contents:
+                    logging.debug("****** There were still bytes left to read, although we should have finished reading. Read: %s" % str(flushed_contents))
                 break
             else:
                 if VERBOSE: logging.debug("Sending chunk of size %d " % chunk_size)
