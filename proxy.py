@@ -11,6 +11,7 @@ import token_bucket
 import argparse
 import logging
 from datetime import datetime, timedelta
+import time
 
 
 ###############################################################################
@@ -120,6 +121,12 @@ def main():
         threads.append(t)
         t.start()
 
+    # spawn thread that periodically clears out the server_connections dict
+    if REUSE_SERVER_CONNECTIONS:
+        t = Thread(target = prune_server_connections_dict, args = [])
+        t.setDaemon(True)
+        t.start()
+
     # accept new socket connections
     while True:
         if VERBOSE: logging.debug('=================== waiting for a connection ==================')
@@ -135,13 +142,23 @@ def main():
 def consumer_thread(id):
     while True:
         request = requests.get()
-        #print "on thread", id, "client:", request[1]
-        # Key is client address
         handle_client_request(*request)
 
-# TODO (kalina) make a thread
 def prune_server_connections_dict():
-    pass
+    while(True):
+        with servers_lock:
+            curr_time = datetime.now()
+            for hostname, connections in server_connections.items():
+                for index, conn in enumerate(connections):
+                    if conn[1] < curr_time:
+                        del connections[index]
+                if connections:
+                    server_connections[hostname] = connections
+                else:
+                    del server_connections[hostname]
+            logging.debug("printing the server connections object")
+            logging.debug(server_connections)
+        time.sleep(4)
 
 
 ###############################################################################
