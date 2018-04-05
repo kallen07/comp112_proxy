@@ -7,6 +7,7 @@ import traceback
 from threading import Thread
 import Queue
 import token_bucket
+import argparse
 from requests.models import Response
 
 MAX_HEADER_BYTES = 8000
@@ -27,6 +28,10 @@ RATE = 100
 CAPACITY = 500
 storage = token_bucket.MemoryStorage()
 limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
+
+# Choosing the verbose option prints every debug statement. Otherwise,
+# only major ones are printed
+VERBOSE = False
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -49,12 +54,28 @@ class HTTPRequest(BaseHTTPRequestHandler):
 
 ################### MAIN #######################
 def main():
-    port = int(sys.argv[1])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
+    parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
+    parser.add_argument("port", help="port to run on", type=int)
+    args = parser.parse_args()
+
+    global VERBOSE
+    if args.verbose:
+        VERBOSE = True
+    else:
+        VERBOSE = False
+
+    port = args.port
 
     # create master socket
     serverSocket = socket(AF_INET, SOCK_STREAM)
-    server_address = ('localhost', port)
+
+    # TODO: Test server_address arg with non-localhost option
+    server_address = (args.server_address, port)
+
     print >> sys.stderr, 'starting up on %s port %s' % server_address
+
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
     serverSocket.listen(1)
@@ -63,12 +84,13 @@ def main():
     threads = []
     for i in xrange(MAX_NUM_THREADS):
         t = Thread(target = consumer_thread, args = [i])
+        t.setDaemon(True)
         threads.append(t)
         t.start()
 
     # accept new socket connections
     while True:
-        print >> sys.stderr, '=================== waiting for a connection =================='
+        if VERBOSE: print >> sys.stderr, '=================== waiting for a connection =================='
         connection, client_address = serverSocket.accept()
         print >> sys.stderr, '=================== new connection from', client_address, '==================='
         connection.settimeout(5)
@@ -100,9 +122,8 @@ def send_rate_limiting_error(connection, client_address, request):
         'Content-Type: text/html',
         html_body
     )
-    print formatted_res
+    if VERBOSE: print >> sys.stderr, formatted_res
     connection.sendall(formatted_res)
-    #connection.sendall(res)
 
 
 def handle_client_request(connection, client_address):
@@ -110,27 +131,32 @@ def handle_client_request(connection, client_address):
     # TODO determine if we need this while True loop
     while True:
         try:
-            print >> sys.stderr, '=================== reading from', client_address, '==================='
+            if VERBOSE: print >> sys.stderr, '=================== reading from', client_address, '==================='
+            else: print >> sys.stderr, "Reading from", client_address
+
             data = connection.recv(MAX_HEADER_BYTES)
             request = HTTPRequest(data)
-            print >> sys.stderr, 'received "%s"' % data
+            if VERBOSE: print >> sys.stderr, 'received "%s"' % data
             if data:
                 # Key is client address
                 success = limiter.consume(client_address)
-                print "CONSUMED TOKEN" if success else "COULD NOT CONSUME TOKEN"
+                if VERBOSE: print "CONSUMED TOKEN" if success else "COULD NOT CONSUME TOKEN"
                 if not success:
+                    print >> sys.stderr, "Client", client_address, "is being rate limited"
                     send_rate_limiting_error(connection, client_address, request)
-                    # TODO: close connection ehre
+                    # TODO: close connection here
                     break
                 response = get_response_from_server(request)
                 send_response_to_client(response, connection)
             else:
                 print >> sys.stderr, 'no more data from', client_address
                 break
+        except (KeyboardInterrupt, SystemExit):
+            if VERBOSE: print >> sys.stderr, "Received KeyboardInterrupt or SystemExit, exiting now"
+            sys.exit()
         except:
-            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Unexpected error:", sys.exc_info())
-            print traceback.print_tb(sys.exc_info()[2])
-            # if sys.exc_info
+            print >> sys.stderr, "********** Caught exception:", sys.exc_info()
+            if VERBOSE: print >> sys.stderr, traceback.print_tb(sys.exc_info()[2])
             print >> sys.stderr, '=================== CLOSING SOCKET =================='
             connection.close()
             break
@@ -146,14 +172,14 @@ def send_response_to_client(response, connection):
         http_version, str(response.status), response.reason,
         '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
     )
-    print >> sys.stderr, "Sending headers"
+    if VERBOSE: print >> sys.stderr, "Sending headers"
     connection.sendall(formatted_header)
-    print(formatted_header)
+    if VERBOSE: print >> sys.stderr, formatted_header
 
     # Chunked responses are forwarded using the approach found here:
     # https://stackoverflow.com/questions/24500752/how-can-i-read-exactly-one-response-chunk-with-pythons-http-client
     if response.getheader('transfer-encoding', '').lower() == 'chunked':
-        print "Sending data as chunked"
+        if VERBOSE: print >> sys.stderr, "Sending chunked body"
 
         def send_chunk_size():
             # size_str will contain the size of the current chunk in hex
@@ -161,7 +187,7 @@ def send_response_to_client(response, connection):
             while size_str[-2:] != b"\r\n":
                 size_str += response.read(1)
 
-            print >> sys.stderr, "chunk size:", size_str[:-2], "(", int(size_str[:-2], 16), ")"
+            if VERBOSE: print >> sys.stderr, "chunk size:", size_str[:-2], "(", int(size_str[:-2], 16), ")"
 
             # adds hex string plus \r\n delimeter to body
             connection.sendall(size_str)
@@ -183,15 +209,15 @@ def send_response_to_client(response, connection):
             chunk_size = send_chunk_size()
 
             if (chunk_size == 0):
-                print >> sys.stderr, "Sending terminating chunk"
+                if VERBOSE: print >> sys.stderr, "Sending terminating chunk"
                 connection.sendall(b"\r\n")
                 break
             else:
-                print >> sys.stderr, "Sending chunk of size", chunk_size
+                if VERBOSE: print >> sys.stderr, "Sending chunk of size", chunk_size
                 send_chunk_data(chunk_size)
 
     else:
-        print >> sys.stderr, "Reading response in one go (not chunked)"
+        if VERBOSE: print >> sys.stderr, "Reading response in one go (not chunked)"
         connection.sendall(response.read())
 
 
@@ -201,7 +227,7 @@ def get_response_from_server(request):
     hostname = request.headers["host"]
 
     conn = httplib.HTTPConnection(hostname)
-    print >> sys.stderr, "Got connection to server"
+    print >> sys.stderr, "Connecting to server with hostname", hostname
 
     # TODO: Chrome does not allow cookies to be set by localhost. Logins will not work with chrome.
     # TODO: Cookies seem to be acting up in Firefox too. I get logged out after a couple of page
