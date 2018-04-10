@@ -96,8 +96,6 @@ def main():
     global VERBOSE
     if args.verbose:
         VERBOSE = True
-    else:
-        VERBOSE = False
 
     port = args.port
 
@@ -107,7 +105,11 @@ def main():
     # TODO: Test server_address arg with non-localhost option
     server_address = (args.server_address, port)
 
-    logging.debug('starting up on %s port %s' % server_address)
+    logging.debug('starting up on %s port %s (%s, %s)' % 
+        (server_address[0], server_address[1],
+        "verbose logging" if VERBOSE else "regular (nonverbose) logging",
+        "reusing connections" if REUSE_SERVER_CONNECTIONS else
+        "using new connections each request"))
 
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
@@ -132,7 +134,7 @@ def main():
         if VERBOSE: logging.debug('=================== waiting for a connection ==================')
         connection, client_address = serverSocket.accept()
         logging.debug('=================== new connection from %s ===================' % str(client_address))
-        connection.settimeout(5)
+        connection.settimeout(10)
         requests.put((connection, client_address))
     
 
@@ -220,68 +222,9 @@ def handle_client_request(connection, client_address):
             break
 
 
-def send_response_to_client(response, connection):
-    headers = response.getheaders()
-    http_version = '1.0' if response.version is 10 else '1.1'
-
-
-    formatted_header = 'HTTP/{} {} {}\r\n{}\r\n\r\n'.format(
-        http_version, str(response.status), response.reason,
-        '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
-    )
-    if VERBOSE: logging.debug("Sending headers")
-    connection.sendall(formatted_header)
-    if VERBOSE: logging.debug(formatted_header)
-
-    # Chunked responses are forwarded using the approach found here:
-    # https://stackoverflow.com/questions/24500752/how-can-i-read-exactly-one-response-chunk-with-pythons-http-client
-    if response.getheader('transfer-encoding', '').lower() == 'chunked':
-        if VERBOSE: logging.debug("Sending chunked body")
-
-        def send_chunk_size():
-            # size_str will contain the size of the current chunk in hex
-            size_str = response.read(2)
-            while size_str[-2:] != b"\r\n":
-                size_str += response.read(1)
-
-            if VERBOSE: logging.debug("chunk size: %s (%d) " % (size_str[:-2], int(size_str[:-2], 16)))
-
-            # adds hex string plus \r\n delimeter to body
-            connection.sendall(size_str)
-            return int(size_str[:-2], 16)
-
-        def send_chunk_data(chunk_size):
-            # data for chunk + \r\n at the end
-            data = response.read(chunk_size + 2)
-
-            # TODO: Error case if data[-2:] != b"\r\n". Maybe throw a custom exception
-            # that the parent thread can catch? Or just silently give up and rely on
-            # eventual retries? Or maybe just manually add the delimeter? Not sure what
-            # the best approach is.
-            if data[-2:] != b"\r\n":
-               logging.debug("ERROR: Chunk did not end in newline-carriage return")
-            connection.sendall(data)
-
-        while True:
-            chunk_size = send_chunk_size()
-
-            if (chunk_size == 0):
-                if VERBOSE: logging.debug("Sending terminating chunk")
-                # Sends the terminating \r\n and completes read of response
-                connection.sendall(response.read(2))
-                
-                # Check that there is nothing left to read
-                flushed_contents = response.read(MAX_HEADER_BYTES)
-                if flushed_contents:
-                    logging.debug("****** There were still bytes left to read, although we should have finished reading. Read: %s" % str(flushed_contents))
-                break
-            else:
-                if VERBOSE: logging.debug("Sending chunk of size %d " % chunk_size)
-                send_chunk_data(chunk_size)
-
-    else:
-        if VERBOSE: logging.debug("Reading response in one go (not chunked)")
-        connection.sendall(response.read())
+def send_response_to_client(response_lines, connection):
+    for line in response_lines:
+        connection.sendall(line)
 
 
 ###############################################################################
@@ -301,8 +244,8 @@ def acquire_server_connection(hostname):
     # TODO starting TTL should be greater than current time
     return (httplib.HTTPConnection(hostname), datetime.now())
 
-def release_server_connection(hostname, conn, TTL):
-    if REUSE_SERVER_CONNECTIONS:
+def release_server_connection(hostname, conn, TTL, connection_close=False):
+    if REUSE_SERVER_CONNECTIONS and not connection_close:
         # increase time to keep the connection open
         TTL = TTL + timedelta(seconds=5)
         if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (conn, hostname, TTL))
@@ -314,7 +257,76 @@ def release_server_connection(hostname, conn, TTL):
                 if VERBOSE: logging.debug("This is the only connection right now for this host")
                 server_connections[hostname] = [(conn, TTL)]
     else:
-        pass # TODO CLOSE CONNECTION?
+        logging.debug("Closing connection %s (host: %s)" % (conn, hostname))
+        conn.close()
+
+def read_response_content(response):
+    response_lines = []
+    headers = response.getheaders()
+    http_version = '1.0' if response.version is 10 else '1.1'
+
+    formatted_header = 'HTTP/{} {} {}\r\n{}\r\n\r\n'.format(
+        http_version, str(response.status), response.reason,
+        '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
+    )
+    if VERBOSE: logging.debug("Adding headers to response")
+    response_lines.append(formatted_header)
+    if VERBOSE: logging.debug(formatted_header)
+
+    # Chunked responses are forwarded using the approach found here:
+    # https://stackoverflow.com/questions/24500752/how-can-i-read-exactly-one-response-chunk-with-pythons-http-client
+    if response.getheader('transfer-encoding', '').lower() == 'chunked':
+        if VERBOSE: logging.debug("Adding chunked body")
+
+        def send_chunk_size():
+            # size_str will contain the size of the current chunk in hex
+            size_str = response.read(2)
+            while size_str[-2:] != b"\r\n":
+                size_str += response.read(1)
+
+            if VERBOSE: logging.debug("chunk size: %s (%d) " % (size_str[:-2], int(size_str[:-2], 16)))
+
+            # adds hex string plus \r\n delimeter to body
+            response_lines.append(size_str)
+            return int(size_str[:-2], 16)
+
+        def send_chunk_data(chunk_size):
+            # data for chunk + \r\n at the end
+            data = response.read(chunk_size + 2)
+
+            # TODO: Error case if data[-2:] != b"\r\n". Maybe throw a custom exception
+            # that the parent thread can catch? Or just silently give up and rely on
+            # eventual retries? Or maybe just manually add the delimeter? Not sure what
+            # the best approach is.
+            if data[-2:] != b"\r\n":
+               logging.debug("ERROR: Chunk did not end in newline-carriage return")
+
+            if VERBOSE: logging.debug("Data (first 20 bytes): %s" % data[:20])
+            response_lines.append(data)
+
+        while True:
+            chunk_size = send_chunk_size()
+
+            if (chunk_size == 0):
+                if VERBOSE: logging.debug("Adding terminating chunk")
+                # Sends the terminating \r\n and completes read of response
+                response_lines.append(response.read(2))
+
+                # Closes response so that if this connection is reused, the response will
+                # will be cleared out. Otherwise this raises ResponseNotReady sometimes
+                response.close()
+
+                break
+            else:
+                if VERBOSE: logging.debug("Adding chunk of size %d " % chunk_size)
+                send_chunk_data(chunk_size)
+
+    else:
+        if VERBOSE: logging.debug("Reading response in one go (not chunked)")
+        #connection.sendall(response.read())
+        response_lines.append(response.read())
+
+    return response_lines
 
 def get_response_from_server(request):
     hostname = request.headers["host"]
@@ -332,18 +344,23 @@ def get_response_from_server(request):
     else:
         conn.request(request.command, request.path.split(hostname)[1], headers=dict(request.headers))
 
+    if VERBOSE: logging.debug("State: %s, response: %s" % (conn._HTTPConnection__state, conn._HTTPConnection__response))
     res = conn.getresponse()
-    # TODO: Flash(?) games don't seem to load properly. (Go to neopets->Game Room, and click on any game.)
-
-    release_server_connection(hostname, conn, TTL)
-
     # Response is marked as not being chunked to allow us to send the chunks
     # correctly later on
     res.chunked = False
+    if VERBOSE: logging.debug("Got response from server, about to read the content from it")
+    res_content = read_response_content(res)
+    # TODO: Flash(?) games don't seem to load properly. (Go to neopets->Game Room, and click on any game.)
 
-    # TODO close this connection or reuse it
-    # conn.close()
-    return res
+    if res.getheader('connection', '') == 'close':
+        if VERBOSE: logging.debug("Read response content, about to release the server connection (close)")
+        release_server_connection(hostname, conn, TTL, True)
+    else:
+        if VERBOSE: logging.debug("Read response content, about to release the server connection (keep-alive)")
+        release_server_connection(hostname, conn, TTL)
+
+    return res_content
 
 
 if __name__ == "__main__":
