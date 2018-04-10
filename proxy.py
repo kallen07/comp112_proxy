@@ -29,7 +29,7 @@ MAX_NUM_THREADS = 20
 requests = Queue.Queue()
 
 # determine if we should reuse server connections across different requests
-REUSE_SERVER_CONNECTIONS = True
+REUSE_SERVER_CONNECTIONS = False
 # list of open socket connections to reuse when connecting to the server
 #   key: hostname
 #   value: [(connection, TTL)]
@@ -89,6 +89,7 @@ class HTTPRequest(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
+    parser.add_argument("-r", "--reuse_connections", help="reuse connections where possible", action="store_true")
     parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
@@ -96,6 +97,10 @@ def main():
     global VERBOSE
     if args.verbose:
         VERBOSE = True
+
+    global REUSE_SERVER_CONNECTIONS 
+    if args.reuse_connections:
+        REUSE_SERVER_CONNECTIONS = True
 
     port = args.port
 
