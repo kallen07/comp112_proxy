@@ -12,6 +12,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta
 import time
+import errno
 
 
 ###############################################################################
@@ -153,6 +154,7 @@ def consumer_thread(id):
 
 def prune_server_connections_dict():
     while(True):
+        logging.debug("Number of requests queued = %d" % (requests.qsize()))
         with servers_lock:
             curr_time = datetime.now()
             for hostname, connections in server_connections.items():
@@ -208,8 +210,13 @@ def handle_client_request(connection, client_address):
                     send_rate_limiting_error(connection, client_address, request)
                     # TODO: close connection here
                     break
-                response = get_response_from_server(request)
-                send_response_to_client(response, connection)
+
+                if request.command == "CONNECT":
+                    handle_HTTPS_request(connection, request)
+                    break
+                else:
+                    response = get_response_from_server(request)
+                    send_response_to_client(response, connection)
             else:
                 logging.debug('no more data from %s' % str(client_address))
                 break
@@ -225,6 +232,54 @@ def handle_client_request(connection, client_address):
             logging.debug('=================== CLOSING SOCKET ==================')
             connection.close()
             break
+
+def handle_HTTPS_request(connection, request):
+    server = socket(AF_INET, SOCK_STREAM)
+    # TODO this is fragile??
+    try:
+        hostname, port = (request.headers["host"]).split(":")
+    except:
+        hostname = request.headers["host"]
+        port = 443
+    server.connect(( hostname, int(port))) # TODO is this f'd
+
+    try:
+        reply = "HTTP/1.1 200 Connection established\r\n"  # TODO can i hardcode this
+        reply += "Proxy-agent: Pyx\r\n"
+        reply += "\r\n"
+        connection.sendall(reply.encode())
+        logging.debug("sending connection est. to client")
+    except error:
+        # If the connection could not be established, exit
+        # Should properly handle the exit with http error code here
+        if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+
+    # Indiscriminately forward bytes
+    connection.setblocking(0)
+    server.setblocking(0)
+    while True:
+        try:
+            logging.debug("Reading from client...")
+            request = connection.recv(1024)
+            logging.debug("Read %d bytes" % len(request))
+            server.sendall( request )
+        except error, v:
+            errorcode = v[0]
+            #if errorcode == errno.ECONNREFUSED:
+            #    logging.debug("Connection Refused")
+            #if errorcode == 35:
+            #logging.debug(errorcode)
+            logging.debug( "********** Caught exception: %s for client" % (str(sys.exc_info())))
+            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+        try:
+            logging.debug("Reading from server...")
+            reply = server.recv(1024)
+            logging.debug("Read %d bytes" % len(reply))
+            connection.sendall( reply )
+        except error, v:
+            errorcode = v[0]
+            logging.debug( "********** Caught exception: %s for client" % (str(sys.exc_info())))
+            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
 
 def send_response_to_client(response_lines, connection):
