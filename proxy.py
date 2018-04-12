@@ -62,7 +62,7 @@ limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 VERBOSE = False
 
 logging.basicConfig(level=logging.DEBUG,
-                    format='[%(levelname)s] (%(threadName)-9s) %(message)s',)
+                    format='[%(asctime)s] (%(threadName)-9s) %(message)s', datefmt='%m-%d %H:%M:%S')
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -255,14 +255,22 @@ def handle_HTTPS_request(connection, request):
         if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
     # Indiscriminately forward bytes
-    connection.setblocking(0)
-    server.setblocking(0)
+    #connection.setblocking(0)
+    connection.settimeout(5)
+    server.settimeout(5)
+    #server.setblocking(0)
+    client_closed = False
+    server_closed = False
     while True:
         try:
             logging.debug("Reading from client...")
             request = connection.recv(1024)
-            logging.debug("Read %d bytes" % len(request))
-            server.sendall( request )
+            logging.debug("Read %d bytes from client" % len(request))
+            if request:
+                logging.debug("\tSending request on to server, because request was not empty")
+                server.sendall( request )
+            else:
+                client_closed = True
         except error, v:
             errorcode = v[0]
             #if errorcode == errno.ECONNREFUSED:
@@ -274,11 +282,19 @@ def handle_HTTPS_request(connection, request):
         try:
             logging.debug("Reading from server...")
             reply = server.recv(1024)
-            logging.debug("Read %d bytes" % len(reply))
-            connection.sendall( reply )
+            logging.debug("Read %d bytes from server" % len(reply))
+            if not reply:
+                server_closed = True
+
+            if client_closed and server_closed:
+                logging.debug("Returning from handle_HTTPS_request because we read 0 bytes from both the server and the client")
+                return
+            if reply and not client_closed:
+                logging.debug("\tSending (nonempty) reply back to the client, because client connection was not closed")
+                connection.sendall( reply )
         except error, v:
             errorcode = v[0]
-            logging.debug( "********** Caught exception: %s for client" % (str(sys.exc_info())))
+            logging.debug( "********** Caught exception: %s for server" % (str(sys.exc_info())))
             if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
 
@@ -396,6 +412,37 @@ def get_response_from_server(request):
     if VERBOSE: logging.debug("Using connection %s (TTL: %s)" % (conn, TTL))
     
 
+    logging.debug("Request path: %s. Split: %s" % (request.path, request.path.split(hostname)))
+
+    # This logic is here because I got ' gaierror(-5, 'No address associated with hostname') '
+    # when trying to make a request with the request.path.split(hostname)[1] logic.
+    # I have not been able to reproduce the error, but this is a method I found that does the
+    # same thing. I wanted to see, if this happened again, whether my method gets the same
+    # result, and what specifically it gets.
+    logging.debug("Alternatively... here's the other method:")
+    url = request.path
+    http_pos = url.find('://')
+    if http_pos == -1:
+        temp = url
+    else:
+        temp = url[(http_pos + 3):]
+
+    port_pos = temp.find(':')
+
+    webserver_pos = temp.find('/')
+    if webserver_pos == -1:
+        webserver_pos = len(temp)
+    webserver = ''
+    port = -1
+
+    if port_pos == -1 or webserver_pos < port_pos:
+        port = 80
+        webserver = temp[:webserver_pos]
+
+    else:
+        port = int((temp[(port_pos + 1):])[:webserver_pos - port_pos -1])
+        webserver = temp[:port_pos]
+    logging.debug(webserver)
     # TODO: Chrome does not allow cookies to be set by localhost. Logins will not work with chrome.
     # TODO: Cookies seem to be acting up in Firefox too. I get logged out after a couple of page
     # changes
