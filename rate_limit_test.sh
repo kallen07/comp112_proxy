@@ -1,25 +1,10 @@
-
-
+#  $1 = file containing list of files to use as samples 
 timestamp=`date +%m-%d_%H%M`
-#  
-# 
-# 
-# 
-# 
-# 
-# 
-# 
-# 
-#           
-# TODO: CHANGE RATE LIMIT TO START AT 0 INSTEAD OF THE FULL CAPACITY
- # 
- # 
- # 
- # 
+
 for ((j=0;j<$1;j++))
 do
-    for i in 100000000,150000000 10000000,15000000 1000000,1500000; do 
-        for file in "logs_apr9_1217am" "logs_apr10_637pm_connection_close" "logs_apr11_529" "halfGB.txt" "1000000B.dat" "500MB.dat"
+    for i in 1000000000,1500000000 100000000,150000000 10000000,15000000 1000000,1500000; do 
+        while read -r line
         do
             echo $file
             IFS=',' read rate cap <<< "${i}"
@@ -38,6 +23,6 @@ do
             sleep 1
             echo Done running script, killing all python now
             killall python
-        done
+        done < "$1"
     done
 done
