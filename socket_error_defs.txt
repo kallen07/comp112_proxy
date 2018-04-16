@@ -1,0 +1,25 @@
+broken pipe
+----------- 
+This error usually means that, the client, after waiting for a specific time, 
+closes the socket connection that was created with the server. But the server 
+doesn't know that and it continues to fetch data from the data source. It will
+come to know that the client has closed the connection only when it tries to
+send the data to the client through the socket connection that was created
+earlier. Hence, you can find this error "IO error: Broken pipe" in the server logs.
+
+
+connection reset by peer
+------------------------
+"Connection reset by peer" is the TCP/IP equivalent of slamming the phone back
+on the hook. It's more polite than merely not replying, leaving one hanging.
+But it's not the FIN-ACK expected of the truly polite TCP/IP converseur. 
+
+bad file descriptor
+-------------------
+In general, when "Bad File Descriptor" is encountered, it means that the socket
+file descriptor you passed into the API is not valid, which has multiple possible
+reasons:
+    The fd is already closed somewhere.
+    The fd has a wrong value, which is inconsistent with the value obtained 
+    from socket() api
+

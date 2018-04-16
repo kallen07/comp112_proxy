@@ -13,7 +13,9 @@ import logging
 from datetime import datetime, timedelta
 import time
 import errno
-
+import select
+from bidict import bidict
+import os
 
 ###############################################################################
 #                          CONSTANTS & GLOBALS                                #
@@ -25,20 +27,23 @@ MAX_HEADER_BYTES = 8000
 # number of threads to handle requests
 MAX_NUM_THREADS = 20
 
-# list of requests to be handled
+# list of HTTP requests to be handled
 # items in the queue are tuples: (connection, client_address)
-requests = Queue.Queue()
+HTTP_requests = Queue.Queue()
+
+# associate HTTPS client and server connections
+HTTPS_server_by_client = bidict()  # key is HTTPS client connection
 
 # determine if we should reuse server connections across different requests
-REUSE_SERVER_CONNECTIONS = False
+REUSE_HTTP_CONNECTIONS = False
 # list of open socket connections to reuse when connecting to the server
 #   key: hostname
 #   value: [(connection, TTL)]
 # value cannot be an empty list - if the key exists then there must be at least
 # one available connection
 # TTL specifies when to close the connection
-server_connections = dict()
-# ALWAYS use servers_lock when accessing the server_connections dict
+HTTP_servers = dict()
+# ALWAYS use servers_lock when accessing the HTTP_servers dict
 servers_lock = Lock()
 
 # rate limiting mechanism (token bucket algo)
@@ -88,6 +93,58 @@ class HTTPRequest(BaseHTTPRequestHandler):
 ###############################################################################
 
 def main():
+    args = handle_command_line_args()
+    msock = create_master_socket(args)
+    spawn_helper_threads()
+
+    inputs = [msock]
+
+    while inputs:
+        readable, _, _ = select.select(inputs, [], [])
+
+        closed_sockets = []
+
+        for s in readable:
+            if s is msock:
+                new_connections = accept_new_connection(s)
+                if new_connections:
+                    inputs = inputs + new_connections
+            elif s not in closed_sockets:
+                try:
+                    data = s.recv(1024)
+                except error, v:
+                    data = None
+                    logging.debug( "********** Caught exception %s in main" % (str(sys.exc_info())))
+                    if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+
+                if data:
+                    forward_bytes(s, data)
+                else:
+                    logging.debug("closing HTTPS connections")
+                    print_HTTPS_server_by_client_bidict()
+                    # remove client-server connection pair from HTTPS_server_by_client
+                    s_prime = HTTPS_server_by_client.get(s)
+                    if s_prime:
+                        # s is a client connection, s_prime is a server connection
+                        HTTPS_server_by_client.pop(s)
+                    else:
+                        # s in a server connection, s_prime is a client connection
+                        s_prime = HTTPS_server_by_client.inv[s]
+                        HTTPS_server_by_client.pop(s_prime)
+
+                    # Stop listening for input on the connections
+                    inputs.remove(s)
+                    inputs.remove(s_prime)
+                    # Close the connections
+                    s.close()
+                    s_prime.close()
+                    # Don't try to read from the connection that we just closed
+                    # This fixes the bad file descriptor errors & cascading issues with attempting to remove
+                    # non-existent items from HTTPS_server_by_client
+                    closed_sockets.append(s_prime)
+
+
+def handle_command_line_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
     parser.add_argument("-r", "--reuse_connections", help="reuse connections where possible", action="store_true")
@@ -95,33 +152,33 @@ def main():
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
 
-    global VERBOSE
     if args.verbose:
         VERBOSE = True
-
-    global REUSE_SERVER_CONNECTIONS 
     if args.reuse_connections:
-        REUSE_SERVER_CONNECTIONS = True
+        REUSE_HTTP_CONNECTIONS = True
+    return args
 
-    port = args.port
 
-    # create master socket
-    serverSocket = socket(AF_INET, SOCK_STREAM)
-
+def create_master_socket(args):
+    msock = socket(AF_INET, SOCK_STREAM)
     # TODO: Test server_address arg with non-localhost option
-    server_address = (args.server_address, port)
+    server_address = (args.server_address, args.port)
 
     logging.debug('starting up on %s port %s (%s, %s)' % 
         (server_address[0], server_address[1],
         "verbose logging" if VERBOSE else "regular (nonverbose) logging",
-        "reusing connections" if REUSE_SERVER_CONNECTIONS else
+        "reusing connections" if REUSE_HTTP_CONNECTIONS else
         "using new connections each request"))
 
-    serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    serverSocket.bind(server_address)
-    serverSocket.listen(1)
+    msock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    msock.bind(server_address)
+    msock.listen(1)
 
-    # create thread pool
+    return msock
+
+
+def spawn_helper_threads():
+    # create thread pool to manage HTTP requests
     threads = []
     for i in xrange(MAX_NUM_THREADS):
         t = Thread(target = consumer_thread, args = [i])
@@ -129,44 +186,124 @@ def main():
         threads.append(t)
         t.start()
 
-    # spawn thread that periodically clears out the server_connections dict
-    if REUSE_SERVER_CONNECTIONS:
-        t = Thread(target = prune_server_connections_dict, args = [])
+    # spawn thread that periodically clears out the HTTP_servers dict
+    # which allows us to reuse HTTP connections
+    if REUSE_HTTP_CONNECTIONS:
+        t = Thread(target = prune_HTTP_servers_dict, args = [])
         t.setDaemon(True)
         t.start()
 
-    # accept new socket connections
-    while True:
-        if VERBOSE: logging.debug('=================== waiting for a connection ==================')
-        connection, client_address = serverSocket.accept()
-        logging.debug('=================== new connection from %s ===================' % str(client_address))
-        connection.settimeout(10)
-        requests.put((connection, client_address))
-    
+
+# accept on the master socket
+# returns a list of socket connections that need to be used
+# as inputs to select()
+def accept_new_connection(msock):
+
+    # accept the new connection
+    connection, client_address = msock.accept()
+    logging.debug('=================== new connection from %s ===================' % str(client_address))
+    connection.settimeout(0.5) # TODO should this be less?
+
+    try:
+        # read the first request and determine the protocol (HTTP or HTTPS)
+        logging.debug('=============== on main thread, reading from %s ===============' % str(client_address))
+        data = connection.recv(MAX_HEADER_BYTES)
+        request = HTTPRequest(data)
+        if VERBOSE: logging.debug('received "%s"' % data)
+        if data:
+            if request.command == "CONNECT":
+                # the new conncetion is an HTTPS CONNECT request
+                server_conn = setup_HTTPS_connection(connection, request)
+                return [connection, server_conn]
+            else:
+                # the connection is an HTTP request
+                HTTP_requests.put((connection, client_address, request))
+    except error, v:
+        # don't print timed out exceptions since they are an unpreventable error
+        if v[0] !=  "timed out":
+            logging.debug( "********** Caught exception: %s" % (str(sys.exc_info())))
+            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+        # if we can't read from the new socket or we can't write to the new socket
+        # something is very wrong, close and return
+        connection.close()
+        return None
+
+# handle HTTPS CONNECT request
+# return an HTTPS server connection
+def setup_HTTPS_connection(client_conn, request):
+    # send response to client
+    reply = "HTTP/1.1 200 Connection established\r\n"  # TODO probably shouldn't hardcode this
+    reply += "Proxy-agent: Pyx\r\n"
+    reply += "\r\n"
+    client_conn.sendall(reply.encode())
+    logging.debug("sending connection est. to client")
+
+    # setup HTTPS connection to server for client
+    server_conn = socket(AF_INET, SOCK_STREAM)
+    try:
+        hostname, port = (request.headers["host"]).split(":")  # this could be fragile
+    except:
+        hostname = request.headers["host"]
+        port = 443
+    server_conn.connect((hostname, int(port)))
+
+    # add server connection to two way dict. of HTTPS server connections
+    HTTPS_server_by_client.put(client_conn, server_conn)
+    return server_conn
+
+
+def forward_bytes(connection, data):
+    try:
+        server = HTTPS_server_by_client.get(connection)
+        if server:
+            # data is from client
+            if VERBOSE: logging.debug("Writing %d bytes to the server with fd %d" %
+                                      (len(data), server.fileno()))
+            server.sendall(data)
+        else:
+            # data is from server
+            client = HTTPS_server_by_client.inv[connection]
+            if VERBOSE: logging.debug("Writing %d bytes to the client with fd %d" %
+                                      (len(data), client.fileno()))
+            client.sendall(data)
+            return
+    except error, v:
+        logging.debug( "********** Caught exception: %s" % (str(sys.exc_info())))
+        if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
+
+
+def print_HTTPS_server_by_client_bidict():
+    socketfds = []
+    for key in HTTPS_server_by_client.keys():
+        socketfds.append((key.fileno(), HTTPS_server_by_client.get(key).fileno()))
+    socketfds.sort(key=lambda tup: tup[1])
+    logging.debug("printing the HTTPS_server_by_client object, which has %d items..." %(len(socketfds)))
+    logging.debug(socketfds)
+
 
 ###############################################################################
 #                                 THREADING                                   #
 ###############################################################################
 def consumer_thread(id):
     while True:
-        request = requests.get()
-        handle_client_request(*request)
+        request = HTTP_requests.get()
+        handle_HTTP_request(*request)
 
-def prune_server_connections_dict():
+def prune_HTTP_servers_dict():
     while(True):
-        logging.debug("Number of requests queued = %d" % (requests.qsize()))
+        logging.debug("Number of requests queued = %d" % (HTTP_requests.qsize()))
         with servers_lock:
             curr_time = datetime.now()
-            for hostname, connections in server_connections.items():
+            for hostname, connections in HTTP_servers.items():
                 for index, conn in enumerate(connections):
                     if conn[1] < curr_time:
                         del connections[index]
                 if connections:
-                    server_connections[hostname] = connections
+                    HTTP_servers[hostname] = connections
                 else:
-                    del server_connections[hostname]
+                    del HTTP_servers[hostname]
             logging.debug("printing the server connections object")
-            logging.debug(server_connections)
+            logging.debug(HTTP_servers)
         time.sleep(4)
 
 
@@ -190,9 +327,13 @@ def send_rate_limiting_error(connection, client_address, request):
     if VERBOSE: logging.debug(formatted_res)
     connection.sendall(formatted_res)
 
-def handle_client_request(connection, client_address):
-    # accept new requests from a connection
-    # TODO determine if we need this while True loop
+def handle_HTTP_request(connection, client_address, request):
+
+    # handle first request
+    response = get_response_from_server(request)
+    send_response_to_client(response, connection)
+
+    # if client sends another request, then handle it
     while True:
         try:
             if VERBOSE: logging.debug('=================== reading from %s ===================' % str(client_address))
@@ -210,13 +351,8 @@ def handle_client_request(connection, client_address):
                     send_rate_limiting_error(connection, client_address, request)
                     # TODO: close connection here
                     break
-
-                if request.command == "CONNECT":
-                    handle_HTTPS_request(connection, request)
-                    break
-                else:
-                    response = get_response_from_server(request)
-                    send_response_to_client(response, connection)
+                response = get_response_from_server(request)
+                send_response_to_client(response, connection)
             else:
                 logging.debug('no more data from %s' % str(client_address))
                 break
@@ -233,70 +369,6 @@ def handle_client_request(connection, client_address):
             connection.close()
             break
 
-def handle_HTTPS_request(connection, request):
-    server = socket(AF_INET, SOCK_STREAM)
-    # TODO this is fragile??
-    try:
-        hostname, port = (request.headers["host"]).split(":")
-    except:
-        hostname = request.headers["host"]
-        port = 443
-    server.connect(( hostname, int(port))) # TODO is this f'd
-
-    try:
-        reply = "HTTP/1.1 200 Connection established\r\n"  # TODO can i hardcode this
-        reply += "Proxy-agent: Pyx\r\n"
-        reply += "\r\n"
-        connection.sendall(reply.encode())
-        logging.debug("sending connection est. to client")
-    except error:
-        # If the connection could not be established, exit
-        # Should properly handle the exit with http error code here
-        if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
-
-    # Indiscriminately forward bytes
-    #connection.setblocking(0)
-    connection.settimeout(5)
-    server.settimeout(5)
-    #server.setblocking(0)
-    client_closed = False
-    server_closed = False
-    while True:
-        try:
-            logging.debug("Reading from client...")
-            request = connection.recv(1024)
-            logging.debug("Read %d bytes from client" % len(request))
-            if request:
-                logging.debug("\tSending request on to server, because request was not empty")
-                server.sendall( request )
-            else:
-                client_closed = True
-        except error, v:
-            errorcode = v[0]
-            #if errorcode == errno.ECONNREFUSED:
-            #    logging.debug("Connection Refused")
-            #if errorcode == 35:
-            #logging.debug(errorcode)
-            logging.debug( "********** Caught exception: %s for client" % (str(sys.exc_info())))
-            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
-        try:
-            logging.debug("Reading from server...")
-            reply = server.recv(1024)
-            logging.debug("Read %d bytes from server" % len(reply))
-            if not reply:
-                server_closed = True
-
-            if client_closed and server_closed:
-                logging.debug("Returning from handle_HTTPS_request because we read 0 bytes from both the server and the client")
-                return
-            if reply and not client_closed:
-                logging.debug("\tSending (nonempty) reply back to the client, because client connection was not closed")
-                connection.sendall( reply )
-        except error, v:
-            errorcode = v[0]
-            logging.debug( "********** Caught exception: %s for server" % (str(sys.exc_info())))
-            if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
-
 
 def send_response_to_client(response_lines, connection):
     for line in response_lines:
@@ -308,30 +380,29 @@ def send_response_to_client(response_lines, connection):
 ###############################################################################
 
 def acquire_server_connection(hostname):
-    if REUSE_SERVER_CONNECTIONS:
+    if REUSE_HTTP_CONNECTIONS:
         with servers_lock:
-            connections = server_connections.pop(hostname, None)
+            connections = HTTP_servers.pop(hostname, None)
             if connections is not None:
                 conn = connections.pop()
                 if connections:
-                    server_connections[hostname] = connections
+                    HTTP_servers[hostname] = connections
                 return conn
 
-    # TODO starting TTL should be greater than current time
     return (httplib.HTTPConnection(hostname), datetime.now())
 
 def release_server_connection(hostname, conn, TTL, connection_close=False):
-    if REUSE_SERVER_CONNECTIONS and not connection_close:
+    if REUSE_HTTP_CONNECTIONS and not connection_close:
         # increase time to keep the connection open
         TTL = TTL + timedelta(seconds=5)
         if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (conn, hostname, TTL))
         with servers_lock:
-            if hostname in server_connections:
+            if hostname in HTTP_servers:
                 if VERBOSE: logging.debug("There were already %d connections for this host" % (len(server_connections[hostname])))
-                server_connections[hostname].append((conn, TTL))
+                HTTP_servers[hostname].append((conn, TTL))
             else:
                 if VERBOSE: logging.debug("This is the only connection right now for this host")
-                server_connections[hostname] = [(conn, TTL)]
+                HTTP_servers[hostname] = [(conn, TTL)]
     else:
         logging.debug("Closing connection %s (host: %s)" % (conn, hostname))
         conn.close()
