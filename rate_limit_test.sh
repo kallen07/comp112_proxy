@@ -1,4 +1,6 @@
-#  $1 = file containing list of files to use as samples 
+#  $1 = number of trials to run
+#  $2 = file containing list of files to use as samples 
+
 timestamp=`date +%m-%d_%H%M`
 
 for ((j=0;j<$1;j++))
