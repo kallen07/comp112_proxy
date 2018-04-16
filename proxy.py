@@ -1,3 +1,5 @@
+# code to test rate limiting
+
 from socket import *
 import sys
 from BaseHTTPServer import BaseHTTPRequestHandler
@@ -51,18 +53,17 @@ servers_lock = Lock()
 #   can hold. Once the bucket is full, additional tokens
 #   are discarded.
 
-# Rate and capacity units: number of requests (per client)
-RATE = 100
-CAPACITY = 500
-storage = token_bucket.MemoryStorage()
-limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
+# Rate and capacity units: bytes per second (per client)
+RATE = 1000000
+CAPACITY = 50000000
 
 # Choosing the verbose option prints every debug statement. Otherwise,
 # only major ones are printed
 VERBOSE = False
 
 logging.basicConfig(level=logging.DEBUG,
-                    format='[%(levelname)s] (%(threadName)-9s) %(message)s',)
+                    format='[%(asctime)s.%(msecs)03d] (%(threadName)-9s) %(message)s',
+                    datefmt='%m-%d,%H:%M:%S')
 
 class HTTPRequest(BaseHTTPRequestHandler):
     def __init__(self, request_text):
@@ -91,6 +92,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
     parser.add_argument("-r", "--reuse_connections", help="reuse connections where possible", action="store_true")
+    parser.add_argument("--bandwidth", help="limits client's allowed bandwidth (bytes/sec)", type=int, required=False)
+    parser.add_argument("--burst_rate", help="max bandwidth client is allowed (bytes/sec)", type=int, required=False)
     parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
@@ -103,6 +106,18 @@ def main():
     if args.reuse_connections:
         REUSE_SERVER_CONNECTIONS = True
 
+    global RATE
+    if args.bandwidth:
+        RATE = args.bandwidth
+
+    global CAPACITY 
+    if args.burst_rate:
+        CAPACITY = args.burst_rate
+
+    global limiter
+    storage = token_bucket.MemoryStorage()
+    limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
+
     port = args.port
 
     # create master socket
@@ -111,11 +126,12 @@ def main():
     # TODO: Test server_address arg with non-localhost option
     server_address = (args.server_address, port)
 
-    logging.debug('starting up on %s port %s (%s, %s)' % 
+    logging.debug('starting up on %s port %s (%s, %s), rate=%d, burst=%d' % 
         (server_address[0], server_address[1],
         "verbose logging" if VERBOSE else "regular (nonverbose) logging",
         "reusing connections" if REUSE_SERVER_CONNECTIONS else
-        "using new connections each request"))
+        "using new connections each request",
+        RATE, CAPACITY))
 
     serverSocket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     serverSocket.bind(server_address)
@@ -202,21 +218,24 @@ def handle_client_request(connection, client_address):
             request = HTTPRequest(data)
             if VERBOSE: logging.debug('received "%s"' % data)
             if data:
-                # Key is client address
-                success = limiter.consume(client_address)
-                if VERBOSE: logging.debug("CONSUMED TOKEN" if success else "COULD NOT CONSUME TOKEN")
-                if not success:
-                    logging.debug("Client %s is being rate limited" % client_address)
-                    send_rate_limiting_error(connection, client_address, request)
-                    # TODO: close connection here
-                    break
+                # Token bucket will automatically begin with CAPACITY tokens. We want
+                # it to begin at 0 tokens
+                # tokens == 0 if the current user has not yet made a request
+                if limiter._storage.get_token_count(client_address[0]) == 0:
+                    logging.debug("%s is accessing the proxy for the first time, their token count is 0" % (str(client_address)))
+                    # Replenish with capacity = 0 to force the initial token count to be 0
+                    limiter._storage.replenish(client_address[0], RATE, 0) 
+                    if limiter._storage.get_token_count(client_address[0]) != 0:
+                        logging.debug("ERROR: Token count should be 0 because we replenished with 0, but it's actually %f" %
+                            (limiter._storage.get_token_count(client_address[0])))
+                else:
+                    logging.debug("%s has %f tokens" % (str(client_address), limiter._storage.get_token_count(client_address[0])))
 
                 if request.command == "CONNECT":
                     handle_HTTPS_request(connection, request)
                     break
                 else:
-                    response = get_response_from_server(request)
-                    send_response_to_client(response, connection)
+                    get_and_forward_response_from_server(request, client_address, connection)
             else:
                 logging.debug('no more data from %s' % str(client_address))
                 break
@@ -227,8 +246,8 @@ def handle_client_request(connection, client_address):
             logging.debug( "********** Caught exception: %s for client %s" % (str(sys.exc_info()), str(client_address)))
             if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
             if 'BadStatusLine' in str(sys.exc_info()[1]):
-                logging.debug("Reraising bad status line...")
-                raise
+                logging.debug("!!!!bad status line...")
+                #raise
             logging.debug('=================== CLOSING SOCKET ==================')
             connection.close()
             break
@@ -265,10 +284,6 @@ def handle_HTTPS_request(connection, request):
             server.sendall( request )
         except error, v:
             errorcode = v[0]
-            #if errorcode == errno.ECONNREFUSED:
-            #    logging.debug("Connection Refused")
-            #if errorcode == 35:
-            #logging.debug(errorcode)
             logging.debug( "********** Caught exception: %s for client" % (str(sys.exc_info())))
             if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
         try:
@@ -320,8 +335,33 @@ def release_server_connection(hostname, conn, TTL, connection_close=False):
         logging.debug("Closing connection %s (host: %s)" % (conn, hostname))
         conn.close()
 
-def read_response_content(response):
-    response_lines = []
+def assert_bandwidth_available(client_ip, bytes_requested):
+    global limiter
+
+    success = limiter.consume(client_ip, bytes_requested)
+    while not success:
+        # Seconds to wait until bytes_requested tokens are expected to be available
+        # Note: They actually do not replenish at the exact time we expect, so for small reads we will
+        # wait longer to allow other threads to run. Double the wait time if it's for 1
+        # byte only
+        time_to_wait = bytes_requested / float(RATE)
+        if bytes_requested <= 1:
+            time_to_wait *= 2
+            
+        logging.debug("Client %s is being rate limited for %f seconds to consume %d tokens" % (client_ip, time_to_wait, bytes_requested))
+        time.sleep(time_to_wait)
+        # Try to get tokens again
+        success = limiter.consume(client_ip, bytes_requested)
+    logging.debug("Successfully consumed the %d tokens requested" % bytes_requested)
+
+def get_max_bandwidth(client_ip, bytes_wanted):
+    global limiter
+    curr_available = limiter._storage.get_token_count(client_ip)
+    logging.debug("Getting min of (%f and %f - curr avail)" % (bytes_wanted, curr_available))
+
+    return min(bytes_wanted, curr_available)
+
+def send_response_content(response, client_address, client_connection):
     headers = response.getheaders()
     http_version = '1.0' if response.version is 10 else '1.1'
 
@@ -329,76 +369,102 @@ def read_response_content(response):
         http_version, str(response.status), response.reason,
         '\r\n'.join('{}: {}'.format(k, v) for k, v in headers)
     )
-    if VERBOSE: logging.debug("Adding headers to response")
-    response_lines.append(formatted_header)
+    if VERBOSE: logging.debug("Sending headers as soon as we get the bandwidth")
+    assert_bandwidth_available(client_address[0], len(formatted_header))
+    client_connection.sendall(formatted_header)
+
     if VERBOSE: logging.debug(formatted_header)
 
     # Chunked responses are forwarded using the approach found here:
     # https://stackoverflow.com/questions/24500752/how-can-i-read-exactly-one-response-chunk-with-pythons-http-client
     if response.getheader('transfer-encoding', '').lower() == 'chunked':
-        if VERBOSE: logging.debug("Adding chunked body")
+        if VERBOSE: logging.debug("Sending chunked body")
 
         def send_chunk_size():
+            assert_bandwidth_available(client_address[0], 2)
+
             # size_str will contain the size of the current chunk in hex
             size_str = response.read(2)
             while size_str[-2:] != b"\r\n":
+                assert_bandwidth_available(client_address[0], 1)
                 size_str += response.read(1)
 
             if VERBOSE: logging.debug("chunk size: %s (%d) " % (size_str[:-2], int(size_str[:-2], 16)))
 
             # adds hex string plus \r\n delimeter to body
-            response_lines.append(size_str)
+            client_connection.sendall(size_str)
             return int(size_str[:-2], 16)
 
         def send_chunk_data(chunk_size):
+            data = ""
             # data for chunk + \r\n at the end
-            data = response.read(chunk_size + 2)
-
-            # TODO: Error case if data[-2:] != b"\r\n". Maybe throw a custom exception
-            # that the parent thread can catch? Or just silently give up and rely on
-            # eventual retries? Or maybe just manually add the delimeter? Not sure what
-            # the best approach is.
-            if data[-2:] != b"\r\n":
-               logging.debug("ERROR: Chunk did not end in newline-carriage return")
+            bytes_to_send = chunk_size + 2
+            bytes_sent = 0
+            while bytes_sent < bytes_to_send:
+                # Returns the number of bytes we wanted, or the number of bytes we can currently request
+                available_bandwidth = get_max_bandwidth(client_address[0], bytes_to_send - bytes_sent)
+                # We cannot consume fewer than 1 tokens
+                if available_bandwidth < 1:
+                    available_bandwidth = 1
+                # Ensures that the number of bytes we wanted are still available (sleeps if they are not)
+                assert_bandwidth_available(client_address[0], available_bandwidth)
+                client_connection.sendall(response.read(int(available_bandwidth)))
+                bytes_sent += int(available_bandwidth)
 
             if VERBOSE: logging.debug("Data (first 20 bytes): %s" % data[:20])
-            response_lines.append(data)
 
         while True:
             chunk_size = send_chunk_size()
 
             if (chunk_size == 0):
-                if VERBOSE: logging.debug("Adding terminating chunk")
+                if VERBOSE: logging.debug("Sending terminating chunk")
                 # Sends the terminating \r\n and completes read of response
-                response_lines.append(response.read(2))
-
-                # Closes response so that if this connection is reused, the response will
-                # will be cleared out. Otherwise this raises ResponseNotReady sometimes
-                response.close()
+                assert_bandwidth_available(client_address[0], 2)
+                client_connection.sendall(response.read(2))
 
                 break
             else:
-                if VERBOSE: logging.debug("Adding chunk of size %d " % chunk_size)
+                if VERBOSE: logging.debug("Sending chunk of size %d " % chunk_size)
                 send_chunk_data(chunk_size)
 
     else:
         if VERBOSE: logging.debug("Reading response in one go (not chunked)")
-        #connection.sendall(response.read())
-        response_lines.append(response.read())
+        bytes_to_send = int(response.getheader("content-length", 0))
+        bytes_sent = 0
+        while bytes_sent < bytes_to_send:
+            # Returns the number of bytes we wanted, or the number of bytes we can currently request
+            available_bandwidth = get_max_bandwidth(client_address[0], bytes_to_send - bytes_sent)
+            # We cannot consume fewer than 1 tokens
+            if available_bandwidth < 1:
+                available_bandwidth = 1
+            # Ensures that the number of bytes we wanted are still available (sleeps if they are not)
+            assert_bandwidth_available(client_address[0], available_bandwidth)
+            client_connection.sendall(response.read(int(available_bandwidth)))
+            bytes_sent += int(available_bandwidth)
 
-    return response_lines
 
-def get_response_from_server(request):
+    # Closes response so that if this connection is reused, the response will
+    # will be cleared out. Otherwise this raises ResponseNotReady sometimes
+    # TODO: This might be causing malformed responses later on, not sure
+    logging.debug("Closing response (%s)" % (str(response)))
+    response.close()
+
+def get_and_forward_response_from_server(request, client_address, client_connection):
     hostname = request.headers["host"]
 
     logging.debug("Connecting to server with hostname %s" % hostname)
     conn, TTL = acquire_server_connection(hostname)
     if VERBOSE: logging.debug("Using connection %s (TTL: %s)" % (conn, TTL))
     
+    logging.debug(request.headers)
+    if "Proxy-Connection" in request.headers:
+        logging.debug("proxy-connection was in the headers, with value %s" % request.headers["Proxy-Connection"])
+        #request.headers['Connection'] = request.headers['Proxy-Connection']
+        # logging.debug("Added Connection header to request head")
 
+    logging.debug("Request path: %s" % request.path)
+    logging.debug("Split: %s" % request.path.split(hostname))
     # TODO: Chrome does not allow cookies to be set by localhost. Logins will not work with chrome.
-    # TODO: Cookies seem to be acting up in Firefox too. I get logged out after a couple of page
-    # changes
     if request.body:
         conn.request(request.command, request.path.split(hostname)[1], body=request.body, headers=dict(request.headers))
     else:
@@ -410,9 +476,10 @@ def get_response_from_server(request):
     # correctly later on
     res.chunked = False
     if VERBOSE: logging.debug("Got response from server, about to read the content from it")
-    res_content = read_response_content(res)
+    send_response_content(res, client_address, client_connection)
     # TODO: Flash(?) games don't seem to load properly. (Go to neopets->Game Room, and click on any game.)
 
+    #  or ("Proxy-Connection" in request.headers and request.headers["Proxy-Connection"].lower() == "close")
     if res.getheader('connection', '') == 'close':
         if VERBOSE: logging.debug("Read response content, about to release the server connection (close)")
         release_server_connection(hostname, conn, TTL, True)
@@ -420,7 +487,6 @@ def get_response_from_server(request):
         if VERBOSE: logging.debug("Read response content, about to release the server connection (keep-alive)")
         release_server_connection(hostname, conn, TTL)
 
-    return res_content
 
 
 if __name__ == "__main__":
