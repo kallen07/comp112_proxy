@@ -155,8 +155,11 @@ def handle_command_line_args():
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
 
+    global VERBOSE
     if args.verbose:
         VERBOSE = True
+
+    global REUSE_HTTP_CONNECTIONS
     if args.reuse_connections:
         REUSE_HTTP_CONNECTIONS = True
 
@@ -329,6 +332,19 @@ def prune_HTTP_servers_dict():
 #                          CLIENT INTERACTIONS                                #
 ###############################################################################
 def handle_HTTP_request(connection, client_address, request):
+    # Token bucket will automatically begin with CAPACITY tokens. We want
+    # it to begin at 0 tokens
+    # tokens == 0 if the current user has not yet made a request
+    if limiter._storage.get_token_count(client_address[0]) == 0:
+        logging.debug("%s is accessing the proxy for the first time, their token count is 0" % (str(client_address)))
+        # Replenish with capacity = 0 to force the initial token count to be 0
+        limiter._storage.replenish(client_address[0], RATE, 0) 
+        if limiter._storage.get_token_count(client_address[0]) != 0:
+            logging.debug("ERROR: Token count should be 0 because we replenished with 0, but it's actually %f" %
+                (limiter._storage.get_token_count(client_address[0])))
+    else:
+        logging.debug("%s has %f tokens" % (str(client_address), limiter._storage.get_token_count(client_address[0])))
+
     # handle first request
     get_and_forward_response_from_server(request, client_address, connection)
 
@@ -342,19 +358,6 @@ def handle_HTTP_request(connection, client_address, request):
             request = HTTPRequest(data)
             if VERBOSE: logging.debug('received "%s"' % data)
             if data:
-                # Token bucket will automatically begin with CAPACITY tokens. We want
-                # it to begin at 0 tokens
-                # tokens == 0 if the current user has not yet made a request
-                if limiter._storage.get_token_count(client_address[0]) == 0:
-                    logging.debug("%s is accessing the proxy for the first time, their token count is 0" % (str(client_address)))
-                    # Replenish with capacity = 0 to force the initial token count to be 0
-                    limiter._storage.replenish(client_address[0], RATE, 0) 
-                    if limiter._storage.get_token_count(client_address[0]) != 0:
-                        logging.debug("ERROR: Token count should be 0 because we replenished with 0, but it's actually %f" %
-                            (limiter._storage.get_token_count(client_address[0])))
-                else:
-                    logging.debug("%s has %f tokens" % (str(client_address), limiter._storage.get_token_count(client_address[0])))
-
                 if request.command == "CONNECT":
                     handle_HTTPS_request(connection, request)
                     break
@@ -405,7 +408,7 @@ def release_server_connection(hostname, conn, TTL, connection_close=False):
         if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (conn, hostname, TTL))
         with servers_lock:
             if hostname in HTTP_servers:
-                if VERBOSE: logging.debug("There were already %d connections for this host" % (len(server_connections[hostname])))
+                if VERBOSE: logging.debug("There were already %d connections for this host" % (len(HTTP_servers[hostname])))
                 HTTP_servers[hostname].append((conn, TTL))
             else:
                 if VERBOSE: logging.debug("This is the only connection right now for this host")
