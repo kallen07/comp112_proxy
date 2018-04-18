@@ -1,0 +1,14 @@
+httplib implementation:
+https://github.com/enthought/Python-2.7.3/blob/master/Lib/httplib.py
+
+parse raw http headers:
+https://stackoverflow.com/questions/4685217/parse-raw-http-headers
+
+template code for an https proxy:
+https://stackoverflow.com/questions/24218058/python-https-proxy-tunnelling
+
+use curl to forward request through a proxy:
+https://stackoverflow.com/questions/9445489/performing-http-requests-with-curl-using-proxy
+
+self-signed certificates:
+https://serverfault.com/questions/280796/transparent-ssl-proxy-myths-and-facts
