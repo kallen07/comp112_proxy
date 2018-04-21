@@ -128,8 +128,8 @@ def main():
 
                 # handle the data
                 if data:
-                    forward_bytes(s, data)                        
-                # cleanup        
+                    forward_bytes(s, data)
+                # cleanup
                 else:
                     logging.debug("closing HTTPS connections")
                     print_server_by_client_bidict()
@@ -152,9 +152,15 @@ def main():
 
                     # Close the connections
                     if type_of_connection == "HTTPS":
+                        # always close HTTPS server connections
                         server_conn.close()
                     else:
-                        release_HTTP_server_connection(server_conn, HTTP_conn_to_TTL(server_conn))
+                        # close HTTP server connections unless client exited gracefully
+                        close_server_conn = True
+                        if s is client_conn and was_clean_close(client_conn):
+                            close_server_conn = False
+                        release_HTTP_server_connection(server_conn, HTTP_conn_to_TTL(server_conn), close_server_conn)
+
                     client_conn.close()
 
                     # Don't try to read from the connection that we just closed
@@ -475,6 +481,9 @@ def get_max_bandwidth(client_ip, bytes_wanted):
 ###############################################################################
 #                      HTTP DATA STRUCTURE MANIPULATION                       #
 ###############################################################################
+
+def was_clean_close(client_conn):
+    return False # TODO fix this
 
 def acquire_HTTP_server_connection(host):
     # look for an existing, available connection
