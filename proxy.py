@@ -33,7 +33,7 @@ server_by_client = bidict()  # key is the client connection
 # map client connections to client IPs
 client_IPS = dict()
 
-# map in-use HTTP connections to their time to live (TTL) values
+# map in-use HTTP server connections to (TTL, host)
 HTTP_conn_to_TTL = dict()
 
 # determine if we should reuse server connections across different requests
@@ -159,7 +159,8 @@ def main():
                         close_server_conn = True
                         if s is client_conn and was_clean_close(client_conn):
                             close_server_conn = False
-                        release_HTTP_server_connection(server_conn, HTTP_conn_to_TTL(server_conn), close_server_conn)
+                        TTL, host =  HTTP_conn_to_TTL[server_conn]
+                        release_HTTP_server_connection(host, server_conn, TTL, close_server_conn)
 
                     client_conn.close()
 
@@ -239,7 +240,6 @@ def spawn_helper_thread():
 
 def prune_HTTP_servers_dict():
     while(True):
-        logging.debug("Number of requests queued = %d" % (HTTP_requests.qsize()))
         with servers_lock:
             curr_time = datetime.now()
             for hostname, connections in HTTP_servers.items():
@@ -285,8 +285,8 @@ def accept_new_connection(msock):
                 server_conn = setup_HTTPS_connection(connection, request)
             else:
                 # the connection is an HTTP request
-                server_conn = setup_HTTP_connection(connection, request)
-            return [connection, server_conn]  # TODO is this sketcy AF
+                server_conn = setup_HTTP_connection(connection, request, data)
+            return [connection, server_conn]
 
     except error, v:
         # don't print timed out exceptions since they are an unpreventable error
@@ -304,6 +304,7 @@ def accept_new_connection(msock):
 def split_host(host):
     try:
         hostname, port = host.split(":")  # this could be fragile
+        port = int(port)
         return (hostname, port)
     except:
         return (host, None)
@@ -331,11 +332,11 @@ def setup_HTTPS_connection(client_conn, request):
     return server_conn
 
 
-def setup_HTTP_connection(client_conn, request):
+def setup_HTTP_connection(client_conn, request, raw_data):
     host = request.headers["host"]
 
     # acquire HTTP server connection
-    logging.debug("Connecting to server with hostname %s" % host)
+    if VERBOSE: logging.debug("setting up an HTTP connection to server with hostname %s" % host)
     server_conn, TTL = acquire_HTTP_server_connection(host)
     HTTP_conn_to_TTL[server_conn] = (TTL, host)
     if VERBOSE: logging.debug("Using connection %s (TTL: %s)" % (server_conn, TTL))
@@ -347,13 +348,14 @@ def setup_HTTP_connection(client_conn, request):
         #request.headers['Connection'] = request.headers['Proxy-Connection']
         # logging.debug("Added Connection header to request head")
     if VERBOSE: logging.debug("Request path: %s" % request.path)
-    if VERBOSE: logging.debug("Split: %s" % request.path.split(host))
-
-    # send request to server
-    send_HTTP_request_to_server(server_conn, request)
 
     # map between client and server connections
     server_by_client.put(client_conn, server_conn)
+
+    # send request to server
+    # send_HTTP_request_to_server(server_conn, request)
+    forward_bytes(src_conn = client_conn, data = raw_data)
+
     return server_conn
 
 
@@ -361,17 +363,17 @@ def setup_HTTP_connection(client_conn, request):
 #                              HANDLE REQUESTS                                #
 ###############################################################################
 
-def forward_bytes(connection, data):
+def forward_bytes(src_conn, data):
     try:
-        server = server_by_client.get(connection)
-        if server:
+        if src_conn in server_by_client:
             # data is from client
+            server = server_by_client.get(src_conn)
             if VERBOSE: logging.debug("Writing %d bytes to the server with fd %d" %
                                       (len(data), server.fileno()))
             server.sendall(data)
         else:
             # data is from server
-            client = server_by_client.inv[connection]
+            client = server_by_client.inv[src_conn]
             if VERBOSE: logging.debug("Writing %d bytes to the client with fd %d" %
                                       (len(data), client.fileno()))
             client.sendall(data)
