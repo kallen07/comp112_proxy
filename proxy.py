@@ -114,21 +114,24 @@ def main():
     msock = create_master_socket(args)
     spawn_helper_thread()
 
-    inputs = [msock]
+    inputs = set([msock])
 
     global HTTP_client_req_info
 
     while inputs:
+        if VERBOSE: logging.debug("Num inputs: %d \n%s" % (len(inputs), str(inputs)))
         readable, _, _ = select.select(inputs, [], [])
+        if VERBOSE: logging.debug("Num readable: %d" % len(readable))
 
         closed_sockets = []
 
         for s in readable:
             if s is msock:
                 new_connections = accept_new_connection(s)
+                logging.debug("Accepted new connection: %s" % str(new_connections))
                 if new_connections:
-                    logging.debug("Accepted new connections: c: %s, s: %s" % (new_connections[0], new_connections[1]))
-                    inputs = inputs + new_connections
+                    for connection in new_connections:
+                        inputs.add(connection)
             elif s not in closed_sockets:
                 # determine if the socket we read from was a client or a server
                 if s in server_by_client:
@@ -145,6 +148,8 @@ def main():
                 else:
                     type_of_connection = "HTTPS"
 
+                logging.debug("%s was a %s %s" % (str(s), type_of_connection, "client" if s == client_conn else "server"))
+
                 # read from the socket
                 try:
                     bytes_to_read = MAX_HEADER_BYTES
@@ -152,7 +157,7 @@ def main():
                     if type_of_connection == "HTTP" and s == client_conn:
                         # We peek here in case the client is still waiting to finish
                         # the previous response
-                        data = s.recv(bytes_to_read,    MSG_PEEK) 
+                        data = s.recv(bytes_to_read, MSG_PEEK) 
                         if data:
                             if expecting_response_for_client(client_conn):
                                 if VERBOSE: logging.debug("******* Ignoring client %s (peeked %d bytes)" % (str(client_conn), len(data)))
@@ -201,20 +206,16 @@ def main():
                     print_server_by_client_bidict()
 
                     # remove client-server connection pair from server_by_client
-                    if s in server_by_client:
-                        client_conn = s
-                        # s is a client connection, s_prime is a server connection
-                        server_conn = server_by_client.get(client_conn)
-                        server_by_client.pop(client_conn)
-                    else:
-                        server_conn = s
-                        # s in a server connection, s_prime is a client connection
-                        client_conn = server_by_client.inv[server_conn]
-                        server_by_client.pop(client_conn)
+                    server_by_client.pop(client_conn)
 
                     # Stop listening for input on the connections
                     inputs.remove(client_conn)
                     inputs.remove(server_conn)
+
+                    if VERBOSE: logging.debug("No longer listening on client %s and server %s" %
+                        (str(client_conn), str(server_conn)))
+                    if VERBOSE: logging.debug("Just to confirm, this is what inputs looks like now:\n%s" %
+                        (str(inputs)))
 
                     # Close the connections
                     if type_of_connection == "HTTPS":
@@ -225,8 +226,7 @@ def main():
                         close_server_conn = True
                         if s is client_conn and not expecting_response_for_client(client_conn):
                             close_server_conn = False
-                        TTL, host =  HTTP_conn_to_TTL[server_conn]
-                        release_HTTP_server_connection(host, server_conn, TTL, close_server_conn)
+                        release_HTTP_server_connection(server_conn, close_server_conn)
                         del HTTP_client_req_info[client_conn]
 
                     client_conn.close()
@@ -327,32 +327,33 @@ def prune_HTTP_servers_dict():
 # as inputs to select()
 def accept_new_connection(msock):
     # accept the new connection
-    connection, client_address = msock.accept()
+    client_conn, client_address = msock.accept()
     logging.debug('=================== new connection from %s ===================' % str(client_address))
-    connection.settimeout(0.5) # TODO should this be less?
+    client_conn.settimeout(0.5) # TODO should this be less?
 
     try:
         # read the first request and determine the protocol (HTTP or HTTPS)
-        logging.debug('=============== on main thread, reading from %s ===============' % str(client_address))
         # TODO add rate limiting
-        data = connection.recv(MAX_HEADER_BYTES)
+        data = client_conn.recv(MAX_HEADER_BYTES)
         request = HTTPRequest(data)
         if VERBOSE: logging.debug('received "%s"' % data)
         if data:
             # save client IP address
-            client_IPS[connection] = client_address[0]
+            client_IPS[client_conn] = client_address[0]
             if request.command == "CONNECT":
                 # the new conncetion is an HTTPS CONNECT request
-                server_conn = setup_HTTPS_connection(connection, request)
+                server_conn = setup_HTTPS_connection(client_conn, request)
             else:
                 # the connection is an HTTP request
-                HTTP_client_req_info[connection] = dict()
-                reset_client_req_info(connection)
-                HTTP_client_req_info[connection]["state"] = "READING_HEADER"
-                HTTP_client_req_info[connection]["method"] = request.command
+                HTTP_client_req_info[client_conn] = dict()
+                reset_client_req_info(client_conn)
+                HTTP_client_req_info[client_conn]["state"] = "READING_HEADER"
+                HTTP_client_req_info[client_conn]["method"] = request.command
 
-                server_conn = setup_HTTP_connection(connection, request, data)
-            return [connection, server_conn]
+                server_conn = setup_HTTP_connection(client_conn, request, data)
+                if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
+                    str(client_conn), str(server_conn)))
+            return [client_conn, server_conn]
 
     except error, v:
         # don't print timed out exceptions since they are an unpreventable error
@@ -361,7 +362,7 @@ def accept_new_connection(msock):
             if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
         # if we can't read from the new socket or we can't write to the new socket
         # something is very wrong, close and return
-        connection.close()
+        client_conn.close()
         return None
 
 
@@ -513,6 +514,7 @@ def forward_chunk_to_client(client_conn, server_conn, data):
             HTTP_client_req_info[client_conn]["bytes_sent"] = 0
             HTTP_client_req_info[client_conn]["state"] = "READING_CHUNK_SIZE"
             if VERBOSE: logging.debug("[%s] Done sending chunk, req info is %s" % (str(client_conn), str(HTTP_client_req_info[client_conn])))
+        # If it was a terminating chunk, we're done reading this response
         else:
             if VERBOSE: logging.debug("[%s] Done sending terminating chunk, req info is %s" % (str(client_conn), str(HTTP_client_req_info[client_conn])))
 
@@ -713,21 +715,22 @@ def acquire_HTTP_server_connection(host):
     server_conn.connect((hostname, port))
     return (server_conn, datetime.now())
 
-def release_HTTP_server_connection(host, conn, TTL, connection_close=False):
+def release_HTTP_server_connection(server_conn, connection_close=False):
+    TTL, host =  HTTP_conn_to_TTL[server_conn]
     if REUSE_HTTP_CONNECTIONS and not connection_close:
         # increase time to keep the connection open
         TTL = TTL + timedelta(seconds=5)
-        if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (conn, host, TTL))
+        if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (server_conn, host, TTL))
         with servers_lock:
             if host in HTTP_servers:
                 if VERBOSE: logging.debug("There were already %d connections for this host" % (len(HTTP_servers[host])))
-                HTTP_servers[host].append((conn, TTL))
+                HTTP_servers[host].append((server_conn, TTL))
             else:
                 if VERBOSE: logging.debug("This is the only connection right now for this host")
-                HTTP_servers[host] = [(conn, TTL)]
+                HTTP_servers[host] = [(server_conn, TTL)]
     else:
-        logging.debug("Closing connection %s (host: %s)" % (conn, host))
-        conn.close()
+        logging.debug("Closing connection %s (host: %s)" % (server_conn, host))
+        server_conn.close()
 
 ###############################################################################
 #                               DEBUG FUNCTIONS                               #
