@@ -479,15 +479,64 @@ def forward_bytes(src_conn, data):
         logging.debug( "********** Caught exception: %s" % (str(sys.exc_info())))
         if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
+def get_info_from_header(buffered_header):
+    response = httplib.HTTPMessage(StringIO(buffered_header), 0)
+    
+    # On OSX you seem to need to read the headers, while on Windows you do not. The two
+    # seem to be mutually exclusive - one will not work on the other. This is a workaround
+    # to check whether we need to explicitly read the headers or not. If both attempts fail,
+    # we manually parse the headers.
+
+    # Note: We use content-type to determine whether the headers have been parsed out
+    # correctly by the HTTPMessage, since it is common to find that in the headers.
+    # It is not required, however, so it could be missing even if the headers were
+    # parsed correctly.
+
+    # Attempt 1: Not explicitly reading the headers
+    content_type = response.getheader("content-type") 
+    content_length = response.getheader("content-length")
+    transfer_encoding = response.getheader("transfer-encoding") 
+
+    # Attempt 2: Maybe we needed to explicitly read the headers
+    if not content_type:
+        response.readheaders()
+        content_type = response.getheader("content-type") 
+        content_length = response.getheader("content-length")
+        transfer_encoding = response.getheader("transfer-encoding") 
+        # Attempt 3: Parse the fields from the header manually
+        if not content_type:
+            header_lower = buffered_header.lower()
+           
+            if "content-length" in header_lower:
+                content_length_begin = header_lower.find("content-length")
+                content_length_end = header_lower[content_length_begin:].find("\n") + content_length_begin
+                content_length_header = header_lower[content_length_begin:content_length_end + 1]
+                if VERBOSE: logging.debug("Manually parsed out content length header: %s" % content_length_header)
+                if content_length_header:
+                    content_length = content_length_header.split(":")[1].strip()
+                    if VERBOSE: logging.debug("Parsed out this content length: %s" % content_length)
+                else:
+                    content_length = None
+
+            if "transfer-encoding" in header_lower:
+                transfer_encoding_begin = header_lower.find("transfer-encoding")
+                transfer_encoding_end = header_lower[transfer_encoding_begin:].find("\n") + transfer_encoding_begin
+                transfer_encoding_header = header_lower[transfer_encoding_begin:transfer_encoding_end + 1]
+                if VERBOSE: logging.debug("Manually parsed out transfer_encoding header: %s" % transfer_encoding_header)
+                if transfer_encoding_header:
+                    transfer_encoding = transfer_encoding_header.split(":")[1].strip()
+                    if VERBOSE: logging.debug("Parsed out this transfer_encoding: %s" % transfer_encoding)
+                else:
+                    transfer_encoding = None
+    return (content_length, transfer_encoding)
+
 def setup_next_state_from_header(client_conn):
     buffered_header = HTTP_client_req_info[client_conn]["buffered_header"]
     method = HTTP_client_req_info[client_conn]["method"]
 
     if VERBOSE: logging.debug("[%s] Buffered header: |%s|" % (str(client_conn), buffered_header))
-    response = httplib.HTTPMessage(StringIO(buffered_header), 0)
-    response.readheaders()
-    content_length = response.getheader("content-length")
-    transfer_encoding = response.getheader("transfer-encoding") 
+    
+    (content_length, transfer_encoding) = get_info_from_header(buffered_header)
 
     reset_client_req_info(client_conn)
 
