@@ -35,7 +35,7 @@ server_by_client = bidict()  # key is the client connection
 client_IPS = dict()
 
 # List of HTTP clients and servers
-HTTP_connections = list()
+HTTP_connections = set()
 
 # determine if we are using a blacklist
 USING_BLACKLIST = False
@@ -141,7 +141,7 @@ def main():
 
                 # determine the connection type
                 type_of_connection = None
-                if server_conn in HTTP_connections:
+                if s in HTTP_connections:
                     type_of_connection = "HTTP"
                 else:
                     type_of_connection = "HTTPS"
@@ -420,8 +420,8 @@ def setup_HTTP_connection(client_conn, request, raw_data):
     # map between client and server connections
     server_by_client.put(client_conn, server_conn)
 
-    HTTP_connections.append(client_conn)
-    HTTP_connections.append(server_conn)
+    HTTP_connections.add(client_conn)
+    HTTP_connections.add(server_conn)
 
     # send request to server
     # send_HTTP_request_to_server(server_conn, request)
@@ -544,6 +544,11 @@ def setup_next_state_from_header(client_conn):
         HTTP_client_req_info[client_conn]["state"] = "READING_CHUNK_SIZE"
         return "READING_CHUNK_SIZE"
     elif content_length:
+        # We have a body, but it's empty - don't bother reading it
+        if int(content_length) == 0:
+            reset_client_req_info(client_conn)
+            return "IDLE"
+
         HTTP_client_req_info[client_conn]["state"] = "READING_DATA"
         HTTP_client_req_info[client_conn]["curr_content_length"] = int(content_length)
         HTTP_client_req_info[client_conn]["bytes_sent"] = 0
@@ -558,7 +563,9 @@ def setup_next_state_from_header(client_conn):
             return "ERROR: Malformed status line: %s" % status_line
 
 
-        status_code = status_line.split(None)[0]
+        status_code = int(status.split(None)[0])
+        if VERBOSE: logging.debug("Status code: %s, whole status: %s. Status code == 304? %s" % (
+            status_code, status, status_code == 304))
 
         if (status_code == 204 or status_code == 304 or
             100 <= status_code < 200 or      # 1xx codes
@@ -566,7 +573,8 @@ def setup_next_state_from_header(client_conn):
             if VERBOSE: logging.debug("[%s] Received a response that does not have a body, so going back to idle"  % str(client_conn))
             reset_client_req_info(client_conn)
             return "IDLE"
-        return "ERROR: Status line was fine, and code was not one where it should have no body. Status line: %s" % status_line
+        if VERBOSE: logging.debug("ERROR: Status line was fine, and code was not one where it should have no body. Status line: %s. Returning IDLE" % status_line)
+        return "IDLE"
     
 def forward_chunk_to_client(client_conn, server_conn, data):
     content_length = int(HTTP_client_req_info[client_conn]["curr_content_length"])
