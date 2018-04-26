@@ -33,8 +33,13 @@ server_by_client = bidict()  # key is the client connection
 # map client connections to client IPs
 client_IPS = dict()
 
-# List of HTTP clients
+# List of HTTP clients and servers
 HTTP_connections = list()
+
+# determine if we are using a blacklist
+USING_BLACKLIST = False
+# list of blacklisted hostnames
+blacklisted_hostnames = list()
 
 # map client connections to bookkeeping information about the pending request
 # key: client_conn
@@ -230,9 +235,13 @@ def remove_accept_encoding(data):
             index = data.find("Accept-Encoding")
             terminating_newline = data[index:].find("\n") + index
             return data[:index] + data[terminating_newline + 1:]
-    except KeyError:
-        return data
+    # following known execptions have been thrown in the past:
+    # KeyError: 'accept-encoding'
+    # HTTPRequest instance has no attribute 'headers'
+    except:
+        pass
     return data
+
 ###############################################################################
 #                                   UTILS                                     #
 ###############################################################################
@@ -243,6 +252,7 @@ def handle_command_line_args():
     parser.add_argument("--bandwidth", help="limits client's allowed bandwidth (bytes/sec)", type=int, required=False)
     parser.add_argument("--burst_rate", help="max bandwidth client is allowed (bytes/sec)", type=int, required=False)
     parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
+    parser.add_argument("-b", "--blacklist_sites", help="name of file containing list of blacklisted hostnames", type=str, default=None)
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
 
@@ -263,7 +273,20 @@ def handle_command_line_args():
     storage = token_bucket.MemoryStorage()
     limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 
+    global USING_BLACKLIST
+    if args.blacklist_sites is not None:
+        USING_BLACKLIST = True
+        parse_blacklisted_hostnames(args.blacklist_sites)
+
     return args
+
+def parse_blacklisted_hostnames(filename):
+    global blacklisted_hostnames
+    with open(filename) as f:
+        blacklisted_hostnames = f.readlines()
+        blacklisted_hostnames = [x.strip() for x in blacklisted_hostnames]
+
+    logging.debug(blacklisted_hostnames)
 
 def create_master_socket(args):
     msock = socket(AF_INET, SOCK_STREAM)
@@ -279,7 +302,6 @@ def create_master_socket(args):
     msock.listen(1)
 
     return msock
-
 
 
 ###############################################################################
@@ -302,8 +324,17 @@ def accept_new_connection(msock):
         data = remove_accept_encoding(data)
 
         request = HTTPRequest(data)
+
         if VERBOSE: logging.debug('received "%s"' % data)
         if data:
+            # ignore this client if it is trying to access a blacklisted site
+            hostname, _ = split_host(request.headers["host"])
+            logging.debug("the hostname is %s", hostname)
+            if is_blacklisted(hostname):
+                send_blacklisted_response(client_conn, hostname)
+                client_conn.close()
+                return None
+
             # save client IP address
             client_IPS[client_conn] = client_address[0]
             if request.command == "CONNECT":
@@ -348,6 +379,7 @@ def split_host(host):
 # handle HTTPS CONNECT request
 # return an HTTPS server connection
 def setup_HTTPS_connection(client_conn, request):
+
     # send response to client
     reply = "HTTP/1.1 200 Connection established\r\n"  # TODO probably shouldn't hardcode this
     reply += "Proxy-agent: Pyx\r\n"
@@ -355,11 +387,13 @@ def setup_HTTPS_connection(client_conn, request):
     client_conn.sendall(reply.encode())
     logging.debug("sending connection est. to client")
 
-    # setup HTTPS connection to server for client
-    server_conn = socket(AF_INET, SOCK_STREAM)
+    # parse hostname and port
     hostname, port = split_host(request.headers["host"])
     if port is None:
         port = 443
+
+    # setup HTTPS connection to server for client
+    server_conn = socket(AF_INET, SOCK_STREAM)
     server_conn.connect((hostname, int(port)))
 
     # map between client and server connections
@@ -394,6 +428,29 @@ def setup_HTTP_connection(client_conn, request, raw_data):
     forward_bytes(src_conn = client_conn, data = raw_data)
 
     return server_conn
+
+def is_blacklisted(hostname):
+    if USING_BLACKLIST:
+        for bad_hostname in blacklisted_hostnames:
+            if hostname.find(bad_hostname) > 0:
+                logging.debug("not allowing a connection from %s since %s is blacklisted" % (hostname, bad_hostname))
+                return True
+
+    return False
+
+def send_blacklisted_response(client_conn, hostname):
+    html_body = "<html><head><title>Forbidden</title></head><body> \
+    <h1>Forbidden</h1> \
+    <p>Uh oh, Kalina and Elena Inc. blacklisted all %s webpages because \
+    they impact employee productivity! This attempt has been recorded</p> \
+    </body></html>".format(hostname)
+    formatted_res = 'HTTP/{} {} {}\r\n{}\r\n\r\n{}\r\n'.format(
+        '1.0', 403, "Forbidden",
+        'Content-Type: text/html',
+        html_body
+    )
+    if VERBOSE: logging.debug("sending the following blacklisted res: \n %s" % formatted_res)
+    client_conn.sendall(formatted_res)
 
 
 ###############################################################################
@@ -630,7 +687,7 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     if state == "IDLE":
         # This is an error case. The server should not be sending data while
         # the connection is in idle state
-        logging.debug("ERROR: Server (%s) for client %s sent data while in idle state. Data read: %s" %
+        if VERBOSE: logging.debug("ERROR: Server (%s) for client %s sent data while in idle state. Data read: %s" %
             (str(server_conn), str(client_conn), data))
     elif state == "READING_HEADER":
         unread_data = update_buffered_header(client_conn, server_conn, data)
@@ -642,7 +699,7 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     elif state == "READING_CHUNK_SIZE":
         unread_data = update_buffered_chunk_size_str(client_conn, server_conn, data)
     else: 
-        logging.debug("ERROR: Unknown state %s" % state)
+        if VERBOSE: logging.debug("ERROR: Unknown state %s" % state)
 
     if unread_data:
         if VERBOSE: logging.debug("[%s] Some data left unread after handling. Calling handle again" % str(client_conn))
