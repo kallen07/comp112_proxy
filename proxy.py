@@ -24,17 +24,17 @@ import os
 ###############################################################################
 
 # max number of bytes that can be in an HTTP header
-# NEEDSWORK: Can this cover requests with bodies? (eg POST)
+# TODO: Can this cover requests with bodies? (eg POST)
 MAX_HEADER_BYTES = 8000
 
-# associate all client connections to a server connections
+# associate all client connections to a server connection
 server_by_client = bidict()  # key is the client connection
 
 # map client connections to client IPs
 client_IPS = dict()
 
-# map in-use HTTP server connections to (TTL, host)
-HTTP_conn_to_TTL = dict()
+# List of HTTP clients
+HTTP_clients = list()
 
 # map client connections to bookkeeping information about the pending request
 # key: client_conn
@@ -52,17 +52,6 @@ HTTP_conn_to_TTL = dict()
 #                                  hex string
 HTTP_client_req_info = dict()
 
-# determine if we should reuse server connections across different requests
-REUSE_HTTP_CONNECTIONS = False
-# list of open socket connections to reuse when connecting to the server
-#   key: hostname
-#   value: [(connection, TTL)]
-# value cannot be an empty list - if the key exists then there must be at least
-# one available connection
-# TTL specifies when to close the connection
-HTTP_servers = dict()
-# ALWAYS use servers_lock when accessing the HTTP_servers dict
-servers_lock = Lock()
 
 # rate limiting mechanism (token bucket algo)
 # rate: Number of tokens per second to add to the
@@ -112,7 +101,6 @@ class HTTPRequest(BaseHTTPRequestHandler):
 def main():
     args = handle_command_line_args()
     msock = create_master_socket(args)
-    spawn_helper_thread()
 
     inputs = set([msock])
 
@@ -143,12 +131,12 @@ def main():
 
                 # determine the connection type
                 type_of_connection = None
-                if server_conn in HTTP_conn_to_TTL:
+                if server_conn in HTTP_clients:
                     type_of_connection = "HTTP"
                 else:
                     type_of_connection = "HTTPS"
 
-                logging.debug("%s was a %s %s" % (str(s), type_of_connection, "client" if s == client_conn else "server"))
+                if VERBOSE: logging.debug("%s was a %s %s" % (str(s), type_of_connection, "client" if s == client_conn else "server"))
 
                 # read from the socket
                 try:
@@ -168,14 +156,14 @@ def main():
                                 data = s.recv(bytes_to_read) 
                     else:
                         data = s.recv(bytes_to_read)
-                        logging.debug("******* Read %d bytes from socket %s, which is an %s %s" %
+                        if VERBOSE: logging.debug("******* Read %d bytes from socket %s, which is an %s %s" %
                             (len(data), str(s), type_of_connection, "client" if s == client_conn else "server"))
                 except error, v:
                     data = None
                     logging.debug( "********** Caught exception %s in main" % (str(sys.exc_info())))
                     if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
-                # tODO: determine how many tokens were actually used and replenish what
+                # TODO: determine how many tokens were actually used and replenish what
                 # wasn't used
 
                 # TODO: Wrap this whole thing in a try-catch and close the connection if
@@ -208,6 +196,10 @@ def main():
                     # remove client-server connection pair from server_by_client
                     server_by_client.pop(client_conn)
 
+                    # remove client from list of HTTP clients
+                    if client_conn in HTTP_clients:
+                        HTTP_clients.remove(client_conn)
+
                     # Stop listening for input on the connections
                     inputs.remove(client_conn)
                     inputs.remove(server_conn)
@@ -218,17 +210,7 @@ def main():
                         (str(inputs)))
 
                     # Close the connections
-                    if type_of_connection == "HTTPS":
-                        # always close HTTPS server connections
-                        server_conn.close()
-                    else:
-                        # close HTTP server connections unless client exited gracefully
-                        close_server_conn = True
-                        if s is client_conn and not expecting_response_for_client(client_conn):
-                            close_server_conn = False
-                        release_HTTP_server_connection(server_conn, close_server_conn)
-                        del HTTP_client_req_info[client_conn]
-
+                    server_conn.close()
                     client_conn.close()
 
                     # Don't try to read from the connection that we just closed
@@ -245,30 +227,23 @@ def main():
 def handle_command_line_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
-    parser.add_argument("-r", "--reuse_connections", help="reuse connections where possible", action="store_true")
     parser.add_argument("--bandwidth", help="limits client's allowed bandwidth (bytes/sec)", type=int, required=False)
     parser.add_argument("--burst_rate", help="max bandwidth client is allowed (bytes/sec)", type=int, required=False)
     parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
 
-    global VERBOSE
     if args.verbose:
         VERBOSE = True
-
-    global REUSE_HTTP_CONNECTIONS
-    if args.reuse_connections:
-        REUSE_HTTP_CONNECTIONS = True
 
     global RATE
     if args.bandwidth:
         RATE = args.bandwidth
 
-    global CAPACITY 
+    global CAPACITY
     if args.burst_rate:
         CAPACITY = args.burst_rate
 
-    global limiter
     storage = token_bucket.MemoryStorage()
     limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 
@@ -276,14 +251,11 @@ def handle_command_line_args():
 
 def create_master_socket(args):
     msock = socket(AF_INET, SOCK_STREAM)
-    # TODO: Test server_address arg with non-localhost option
     server_address = (args.server_address, args.port)
 
-    logging.debug('starting up on %s port %s (%s, %s), rate=%d, burst=%d' % 
+    logging.debug('starting up on %s port %s, %s, rate=%d, burst=%d' % 
         (server_address[0], server_address[1],
         "verbose logging" if VERBOSE else "regular (nonverbose) logging",
-        "reusing connections" if REUSE_HTTP_CONNECTIONS else
-        "using new connections each request",
         RATE, CAPACITY))
 
     msock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
@@ -293,30 +265,6 @@ def create_master_socket(args):
     return msock
 
 
-# spawn thread that periodically clears out the HTTP_servers dict
-# which allows us to reuse HTTP connections
-def spawn_helper_thread():
-    if REUSE_HTTP_CONNECTIONS:
-        t = Thread(target = prune_HTTP_servers_dict, args = [])
-        t.setDaemon(True)
-        t.start()
-
-
-def prune_HTTP_servers_dict():
-    while(True):
-        with servers_lock:
-            curr_time = datetime.now()
-            for hostname, connections in HTTP_servers.items():
-                for index, conn in enumerate(connections):
-                    if conn[1] < curr_time:
-                        del connections[index]
-                if connections:
-                    HTTP_servers[hostname] = connections
-                else:
-                    del HTTP_servers[hostname]
-            logging.debug("printing the server connections object")
-            logging.debug(HTTP_servers)
-        time.sleep(4)
 
 ###############################################################################
 #                           SETUP NEW CONNECTIONS                             #
@@ -351,8 +299,8 @@ def accept_new_connection(msock):
                 HTTP_client_req_info[client_conn]["method"] = request.command
 
                 server_conn = setup_HTTP_connection(client_conn, request, data)
-                if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
-                    str(client_conn), str(server_conn)))
+            if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
+                str(client_conn), str(server_conn)))
             return [client_conn, server_conn]
 
     except error, v:
@@ -370,7 +318,7 @@ def accept_new_connection(msock):
 # where port could be None
 def split_host(host):
     try:
-        hostname, port = host.split(":")  # this could be fragile
+        hostname, port = host.split(":")  # TODO: this could be fragile
         port = int(port)
         return (hostname, port)
     except:
@@ -404,9 +352,8 @@ def setup_HTTP_connection(client_conn, request, raw_data):
 
     # acquire HTTP server connection
     if VERBOSE: logging.debug("setting up an HTTP connection to server with hostname %s" % host)
-    server_conn, TTL = acquire_HTTP_server_connection(host)
-    HTTP_conn_to_TTL[server_conn] = (TTL, host)
-    if VERBOSE: logging.debug("Using connection %s (TTL: %s)" % (server_conn, TTL))
+    server_conn = open_HTTP_server_connection(host)
+    if VERBOSE: logging.debug("Using connection %s" % server_conn)
     
     # debugging
     if VERBOSE: logging.debug("Request (raw data):\n%s" % raw_data)
@@ -418,6 +365,8 @@ def setup_HTTP_connection(client_conn, request, raw_data):
 
     # map between client and server connections
     server_by_client.put(client_conn, server_conn)
+
+    HTTP_clients.append(client_conn)
 
     # send request to server
     # send_HTTP_request_to_server(server_conn, request)
@@ -541,7 +490,7 @@ def forward_data_to_client(client_conn, server_conn, data):
     return data[bytes_to_send:]
 
 def reset_client_req_info(client_conn):
-    logging.debug("Resetting client info for %s" % str(client_conn))
+    if VERBOSE: logging.debug("Resetting client info for %s" % str(client_conn))
     HTTP_client_req_info[client_conn]["method"] = ""
     HTTP_client_req_info[client_conn]["bytes_sent"] = 0
     HTTP_client_req_info[client_conn]["content_length"] = 0
@@ -696,41 +645,15 @@ def was_clean_close(client_conn):
     # request state must be "IDLE"
     return HTTP_client_req_info[client_conn]["state"] == "IDLE"
 
-def acquire_HTTP_server_connection(host):
-    # look for an existing, available connection
-    if REUSE_HTTP_CONNECTIONS:
-        with servers_lock:
-            connections = HTTP_servers.pop(host, None)
-            if connections is not None:
-                conn = connections.pop()
-                if connections:
-                    HTTP_servers[host] = connections
-                return conn
-
+def open_HTTP_server_connection(host):
     # setup a new HTTP connection
     server_conn = socket(AF_INET, SOCK_STREAM)
     hostname, port = split_host(host)
     if port is None:
         port = 80
     server_conn.connect((hostname, port))
-    return (server_conn, datetime.now())
+    return server_conn
 
-def release_HTTP_server_connection(server_conn, connection_close=False):
-    TTL, host =  HTTP_conn_to_TTL[server_conn]
-    if REUSE_HTTP_CONNECTIONS and not connection_close:
-        # increase time to keep the connection open
-        TTL = TTL + timedelta(seconds=5)
-        if VERBOSE: logging.debug("Extending TTL for connection %s (Host: %s) to %s" % (server_conn, host, TTL))
-        with servers_lock:
-            if host in HTTP_servers:
-                if VERBOSE: logging.debug("There were already %d connections for this host" % (len(HTTP_servers[host])))
-                HTTP_servers[host].append((server_conn, TTL))
-            else:
-                if VERBOSE: logging.debug("This is the only connection right now for this host")
-                HTTP_servers[host] = [(server_conn, TTL)]
-    else:
-        logging.debug("Closing connection %s (host: %s)" % (server_conn, host))
-        server_conn.close()
 
 ###############################################################################
 #                               DEBUG FUNCTIONS                               #
