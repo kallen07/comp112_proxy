@@ -18,6 +18,7 @@ import errno
 import select
 from bidict import bidict
 import os
+import re
 
 ###############################################################################
 #                          CONSTANTS & GLOBALS                                #
@@ -70,6 +71,10 @@ CAPACITY = 50000000
 # Choosing the verbose option prints every debug statement. Otherwise,
 # only major ones are printed
 VERBOSE = False
+
+# Control whether we are replacing content with "Fahad"
+MODIFY_CONTENT = False
+CONTENT_REPLACE_TARGET = "" 
 
 logging.basicConfig(level=logging.DEBUG,
                     format='[%(asctime)s.%(msecs)03d] (%(threadName)-9s) %(message)s',
@@ -176,7 +181,8 @@ def main():
                         handle_HTTP_server_response(client_conn, server_conn, data)
                     else:
                         if type_of_connection == "HTTP" and s == client_conn:
-                            data = remove_accept_encoding(data)
+                            if MODIFY_CONTENT:
+                                data = remove_accept_encoding(data)
                             # we read a new request from the client
                             request = HTTPRequest(data)
                             
@@ -223,16 +229,6 @@ def main():
                     closed_sockets.append(client_conn)
                     closed_sockets.append(server_conn)
 
-def remove_accept_encoding(data):
-    request = HTTPRequest(data)
-    try:
-        if request.headers["accept-encoding"]:
-            index = data.find("Accept-Encoding")
-            terminating_newline = data[index:].find("\n") + index
-            return data[:index] + data[terminating_newline + 1:]
-    except KeyError:
-        return data
-    return data
 ###############################################################################
 #                                   UTILS                                     #
 ###############################################################################
@@ -240,6 +236,7 @@ def remove_accept_encoding(data):
 def handle_command_line_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", help="print all debug messages", action="store_true")
+    parser.add_argument("--fahad_keyword", help="five-letter word to replace with 'Fahad'", type=str, default="their")
     parser.add_argument("--bandwidth", help="limits client's allowed bandwidth (bytes/sec)", type=int, required=False)
     parser.add_argument("--burst_rate", help="max bandwidth client is allowed (bytes/sec)", type=int, required=False)
     parser.add_argument("-a", "--server_address", help="server's address (eg: localhost)", type=str, default="localhost")
@@ -257,6 +254,12 @@ def handle_command_line_args():
     global CAPACITY
     if args.burst_rate:
         CAPACITY = args.burst_rate
+
+    global MODIFY_CONTENT
+    global CONTENT_REPLACE_TARGET
+    if args.fahad_keyword:
+        MODIFY_CONTENT = True
+        CONTENT_REPLACE_TARGET = args.fahad_keyword[:5] # limit to 5 letters
 
     global limiter
     global storage
@@ -299,7 +302,8 @@ def accept_new_connection(msock):
         # read the first request and determine the protocol (HTTP or HTTPS)
         # TODO add rate limiting
         data = client_conn.recv(MAX_HEADER_BYTES)
-        data = remove_accept_encoding(data)
+        if MODIFY_CONTENT:
+            data = remove_accept_encoding(data)
 
         request = HTTPRequest(data)
         if VERBOSE: logging.debug('received "%s"' % data)
@@ -471,7 +475,8 @@ def forward_chunk_to_client(client_conn, server_conn, data):
     bytes_to_send = min(content_length + 2 - bytes_sent, len(data))
 
     if bytes_to_send > 0:
-        data = modify_content(data)
+        if MODIFY_CONTENT:
+            data = modify_content(data)
         forward_bytes(server_conn, data[:bytes_to_send])
 
     bytes_sent += bytes_to_send
@@ -499,7 +504,8 @@ def forward_data_to_client(client_conn, server_conn, data):
         str(client_conn), str(server_conn), content_length, str(bytes_sent), state))
 
     bytes_to_send = min(content_length - bytes_sent, len(data))
-    data = modify_content(data)
+    if MODIFY_CONTENT:
+        data = modify_content(data)
     forward_bytes(server_conn, data[:bytes_to_send])
 
     bytes_sent += bytes_to_send
@@ -512,10 +518,27 @@ def forward_data_to_client(client_conn, server_conn, data):
     
     return data[bytes_to_send:]
 
+def remove_accept_encoding(data):
+    request = HTTPRequest(data)
+    try:
+        if request.headers["accept-encoding"]:
+            index = data.find("Accept-Encoding")
+            terminating_newline = data[index:].find("\n") + index
+            return data[:index] + data[terminating_newline + 1:]
+    except KeyError:
+        return data
+    except AttributeError:
+        logging.debug("Hmm caught another exception. Here's the data\n%s" % data)
+    return data
+
 def modify_content(data):
-    data = data.replace("their", "Fahad")
-    # if VERBOSE: logging.debug("Modifying content... Did it change anything? %s" % 
-    #     ("It did!!" if "Fahad" in data else "It did not :("))
+    #logging.debug("Before:\n%s" % data)
+    pattern = re.compile(re.escape(CONTENT_REPLACE_TARGET), re.IGNORECASE)
+    data = pattern.sub("Fahad", data)
+    #logging.debug("After:\n%s" % data)
+    # logging.debug("Before:\n%s" % data)
+    # data = data.replace(CONTENT_REPLACE_TARGET, "Fahad")
+    
     return data
 
 def reset_client_req_info(client_conn):
@@ -623,8 +646,7 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     if VERBOSE: logging.debug("Handling %d bytes of data for client %s, state is %s, req info: %s" % (len(data),
         str(client_conn), state, HTTP_client_req_info[client_conn]))
 
-    if VERBOSE: logging.debug("$$$$$$$ Their in data? %s" % ("their" in data))
-    if VERBOSE: logging.debug("Data:\n%s" % data)
+    # if VERBOSE: logging.debug("Data:\n%s" % data)
 
     unread_data = ""
     if state == "IDLE":
