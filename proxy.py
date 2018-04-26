@@ -34,7 +34,7 @@ server_by_client = bidict()  # key is the client connection
 client_IPS = dict()
 
 # List of HTTP clients
-HTTP_clients = list()
+HTTP_connections = list()
 
 # map client connections to bookkeeping information about the pending request
 # key: client_conn
@@ -107,9 +107,9 @@ def main():
     global HTTP_client_req_info
 
     while inputs:
-        if VERBOSE: logging.debug("Num inputs: %d \n%s" % (len(inputs), str(inputs)))
+        #if VERBOSE: logging.debug("Num inputs: %d \n%s" % (len(inputs), str(inputs)))
         readable, _, _ = select.select(inputs, [], [])
-        if VERBOSE: logging.debug("Num readable: %d" % len(readable))
+        #if VERBOSE: logging.debug("Num readable: %d" % len(readable))
 
         closed_sockets = []
 
@@ -131,7 +131,7 @@ def main():
 
                 # determine the connection type
                 type_of_connection = None
-                if server_conn in HTTP_clients:
+                if server_conn in HTTP_connections:
                     type_of_connection = "HTTP"
                 else:
                     type_of_connection = "HTTPS"
@@ -175,16 +175,18 @@ def main():
                     if type_of_connection == "HTTP" and s == server_conn:
                         handle_HTTP_server_response(client_conn, server_conn, data)
                     else:
-                        forward_bytes(s, data)
-
                         if type_of_connection == "HTTP" and s == client_conn:
+                            data = remove_accept_encoding(data)
                             # we read a new request from the client
                             request = HTTPRequest(data)
+                            
                             if VERBOSE: logging.debug("Received new request from http client %s, updating state now to READING_HEADER" % str(client_conn))
                             if VERBOSE: logging.debug("Request body was: %s" % data)
                             reset_client_req_info(client_conn)
                             HTTP_client_req_info[client_conn]["state"] = "READING_HEADER"
                             HTTP_client_req_info[client_conn]["method"] = request.command
+
+                        forward_bytes(s, data)       
                             
                 # cleanup
                 # TODO: Acquire and release HTTP server connection *per request*, not per client
@@ -196,18 +198,20 @@ def main():
                     # remove client-server connection pair from server_by_client
                     server_by_client.pop(client_conn)
 
-                    # remove client from list of HTTP clients
-                    if client_conn in HTTP_clients:
-                        HTTP_clients.remove(client_conn)
+                    # remove client and server from list of HTTP clients
+                    if client_conn in HTTP_connections:
+                        HTTP_connections.remove(client_conn)
+                    if server_conn in HTTP_connections:
+                        HTTP_connections.remove(server_conn)
 
                     # Stop listening for input on the connections
                     inputs.remove(client_conn)
                     inputs.remove(server_conn)
 
-                    if VERBOSE: logging.debug("No longer listening on client %s and server %s" %
-                        (str(client_conn), str(server_conn)))
-                    if VERBOSE: logging.debug("Just to confirm, this is what inputs looks like now:\n%s" %
-                        (str(inputs)))
+                    #if VERBOSE: logging.debug("No longer listening on client %s and server %s" %
+                    #    (str(client_conn), str(server_conn)))
+                    #if VERBOSE: logging.debug("Just to confirm, this is what inputs looks like now:\n%s" %
+                    #    (str(inputs)))
 
                     # Close the connections
                     server_conn.close()
@@ -219,7 +223,16 @@ def main():
                     closed_sockets.append(client_conn)
                     closed_sockets.append(server_conn)
 
-
+def remove_accept_encoding(data):
+    request = HTTPRequest(data)
+    try:
+        if request.headers["accept-encoding"]:
+            index = data.find("Accept-Encoding")
+            terminating_newline = data[index:].find("\n") + index
+            return data[:index] + data[terminating_newline + 1:]
+    except KeyError:
+        return data
+    return data
 ###############################################################################
 #                                   UTILS                                     #
 ###############################################################################
@@ -233,6 +246,7 @@ def handle_command_line_args():
     parser.add_argument("port", help="port to run on", type=int)
     args = parser.parse_args()
 
+    global VERBOSE
     if args.verbose:
         VERBOSE = True
 
@@ -244,6 +258,8 @@ def handle_command_line_args():
     if args.burst_rate:
         CAPACITY = args.burst_rate
 
+    global limiter
+    global storage
     storage = token_bucket.MemoryStorage()
     limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 
@@ -283,6 +299,8 @@ def accept_new_connection(msock):
         # read the first request and determine the protocol (HTTP or HTTPS)
         # TODO add rate limiting
         data = client_conn.recv(MAX_HEADER_BYTES)
+        data = remove_accept_encoding(data)
+
         request = HTTPRequest(data)
         if VERBOSE: logging.debug('received "%s"' % data)
         if data:
@@ -291,6 +309,8 @@ def accept_new_connection(msock):
             if request.command == "CONNECT":
                 # the new conncetion is an HTTPS CONNECT request
                 server_conn = setup_HTTPS_connection(client_conn, request)
+                if VERBOSE: logging.debug("Set up https connection: client %s server %s" % (
+                    str(client_conn), str(server_conn)))
             else:
                 # the connection is an HTTP request
                 HTTP_client_req_info[client_conn] = dict()
@@ -299,8 +319,8 @@ def accept_new_connection(msock):
                 HTTP_client_req_info[client_conn]["method"] = request.command
 
                 server_conn = setup_HTTP_connection(client_conn, request, data)
-            if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
-                str(client_conn), str(server_conn)))
+                if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
+                    str(client_conn), str(server_conn)))
             return [client_conn, server_conn]
 
     except error, v:
@@ -366,7 +386,8 @@ def setup_HTTP_connection(client_conn, request, raw_data):
     # map between client and server connections
     server_by_client.put(client_conn, server_conn)
 
-    HTTP_clients.append(client_conn)
+    HTTP_connections.append(client_conn)
+    HTTP_connections.append(server_conn)
 
     # send request to server
     # send_HTTP_request_to_server(server_conn, request)
@@ -450,6 +471,7 @@ def forward_chunk_to_client(client_conn, server_conn, data):
     bytes_to_send = min(content_length + 2 - bytes_sent, len(data))
 
     if bytes_to_send > 0:
+        data = modify_content(data)
         forward_bytes(server_conn, data[:bytes_to_send])
 
     bytes_sent += bytes_to_send
@@ -477,6 +499,7 @@ def forward_data_to_client(client_conn, server_conn, data):
         str(client_conn), str(server_conn), content_length, str(bytes_sent), state))
 
     bytes_to_send = min(content_length - bytes_sent, len(data))
+    data = modify_content(data)
     forward_bytes(server_conn, data[:bytes_to_send])
 
     bytes_sent += bytes_to_send
@@ -488,6 +511,12 @@ def forward_data_to_client(client_conn, server_conn, data):
             str(client_conn), HTTP_client_req_info[client_conn]["state"]))
     
     return data[bytes_to_send:]
+
+def modify_content(data):
+    data = data.replace("their", "Fahad")
+    # if VERBOSE: logging.debug("Modifying content... Did it change anything? %s" % 
+    #     ("It did!!" if "Fahad" in data else "It did not :("))
+    return data
 
 def reset_client_req_info(client_conn):
     if VERBOSE: logging.debug("Resetting client info for %s" % str(client_conn))
@@ -594,6 +623,9 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     if VERBOSE: logging.debug("Handling %d bytes of data for client %s, state is %s, req info: %s" % (len(data),
         str(client_conn), state, HTTP_client_req_info[client_conn]))
 
+    if VERBOSE: logging.debug("$$$$$$$ Their in data? %s" % ("their" in data))
+    if VERBOSE: logging.debug("Data:\n%s" % data)
+
     unread_data = ""
     if state == "IDLE":
         # This is an error case. The server should not be sending data while
@@ -603,6 +635,7 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     elif state == "READING_HEADER":
         unread_data = update_buffered_header(client_conn, server_conn, data)
     elif state == "READING_DATA":
+
         unread_data = forward_data_to_client(client_conn, server_conn, data)
     elif state == "READING_CHUNK":
         unread_data = forward_chunk_to_client(client_conn, server_conn, data)
