@@ -12,15 +12,12 @@ do
             echo $file            
             echo "File ${file}, sample $j, bandwidth= ${rate} burst rate= ${cap}" >> ${timestamp}_${rate}_${cap}.dat
 
-            `python -m SimpleHTTPServer >& /dev/null & `
-            sleep 1
-            echo Started http server
-            `python proxy.py 8080 -r -v --bandwidth=${rate} --burst_rate=${cap} >& proxy_${timestamp}_${file}_${j}.log & `
+            `python proxy.py 8080 -v --bandwidth=${rate} --burst_rate=${cap} >& proxy_${timestamp}_${file}_${j}_${rate}_${cap}.log & `
             sleep 2
             echo Started proxy
     
-            /usr/bin/time -a -o ratelimit_times_${file}_${timestamp}_${rate}_${cap}.dat -p curl --proxy localhost:8080 localhost:8000/$file > /dev/null
-            echo Done with curl, killing proxy now
+            /usr/bin/time -a -o ratelimit_times_${file}_${timestamp}_${rate}_${cap}.dat -p wget -e use_proxy=yes -e https_proxy=localhost:8080 https://www.eecs.tufts.edu/~kallen07/${file} > /dev/null
+            echo Done with w get, killing proxy now
             killall python
         done < "$2"
     done
@@ -43,5 +40,5 @@ done
 cat final_ratelimit_time_report_${timestamp}.txt
 
 mkdir timing_stats_ratelimit_${timestamp}
-`mv ratelimit_times_*.dat timing_stats_ratelimit_${timestamp}`
+`mv ratelimit_times_*_${timestamp}_*.dat proxy_${timestamp}*.log simpleserver_${timestamp}*.log timing_stats_ratelimit_${timestamp}`
 `cp final_ratelimit_time_report_${timestamp}.txt timing_stats_ratelimit_${timestamp}`
