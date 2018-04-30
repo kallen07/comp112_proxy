@@ -71,7 +71,7 @@ HTTP_client_req_info = dict()
 
 # Rate and capacity units: bytes per second (per client)
 RATE = 1000000
-CAPACITY = 50000000
+CAPACITY = 1500000
 
 # Choosing the verbose option prints every debug statement. Otherwise,
 # only major ones are printed
@@ -150,8 +150,18 @@ def main():
 
                 # read from the socket
                 try:
-                    bytes_to_read = MAX_HEADER_BYTES
-                    # TODO add rate limiting here
+                    # We rate limit only on download, so we limit the amount of data the client
+                    # can get from the server at a time
+                    if s == server_conn:
+                        bytes_to_read = int(get_max_bandwidth(client_conn, MAX_HEADER_BYTES))
+                    else:
+                        bytes_to_read = MAX_HEADER_BYTES
+
+                    # Don't read if we cannot read any bytes, or this will be interpreted as the connection
+                    # closing
+                    if bytes_to_read == 0:
+                        continue
+
                     if type_of_connection == "HTTP" and s == client_conn:
                         # We peek here in case the client is still waiting to finish
                         # the previous response
@@ -168,13 +178,15 @@ def main():
                         data = s.recv(bytes_to_read)
                         if VERBOSE: logging.debug("******* Read %d bytes from socket %s, which is an %s %s" %
                             (len(data), str(s), type_of_connection, "client" if s == client_conn else "server"))
+
                 except error, v:
                     data = None
                     logging.debug( "********** Caught exception %s in main" % (str(sys.exc_info())))
                     if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
-                # TODO: determine how many tokens were actually used and replenish what
-                # wasn't used
+                if s == server_conn and len(data) > 0:
+                    # Remove tokens based on how much was actually read
+                    limiter.consume(client_IPS[client_conn], len(data))
 
                 # TODO: Wrap this whole thing in a try-catch and close the connection if
                 # an exception gets thrown
@@ -352,6 +364,8 @@ def accept_new_connection(msock):
                 server_conn = setup_HTTP_connection(client_conn, request, data)
                 if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
                     str(client_conn), str(server_conn)))
+
+            set_token_quantity(client_conn, 0)
             return [client_conn, server_conn]
 
     except error, v:
@@ -642,13 +656,9 @@ def remove_accept_encoding(data):
     return data
 
 def modify_content(data):
-    #logging.debug("Before:\n%s" % data)
+    # Replaces all instances of CONTENT_REPLACE_TARGET (case insensitive) with "Fahad"
     pattern = re.compile(re.escape(CONTENT_REPLACE_TARGET), re.IGNORECASE)
     data = pattern.sub("Fahad", data)
-    #logging.debug("After:\n%s" % data)
-    # logging.debug("Before:\n%s" % data)
-    # data = data.replace(CONTENT_REPLACE_TARGET, "Fahad")
-    
     return data
 
 def reset_client_req_info(client_conn):
@@ -701,7 +711,6 @@ def update_buffered_header(client_conn, server_conn, data):
     if VERBOSE: logging.debug("[%s] Determined that the next state should be %s" % (str(client_conn), next_state))
 
     return data[curr_pos_in_data:]
-
 
 def update_buffered_chunk_size_str(client_conn, server_conn, data):
     size_str = HTTP_client_req_info[client_conn]["buffered_chunk_size_str"]
@@ -756,8 +765,6 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
     if VERBOSE: logging.debug("Handling %d bytes of data for client %s, state is %s, req info: %s" % (len(data),
         str(client_conn), state, HTTP_client_req_info[client_conn]))
 
-    # if VERBOSE: logging.debug("Data:\n%s" % data)
-
     unread_data = ""
     if state == "IDLE":
         # This is an error case. The server should not be sending data while
@@ -784,16 +791,58 @@ def handle_HTTP_server_response(client_conn, server_conn, data):
 #                          RATE LIMITING UTILS                                #
 ###############################################################################
 
-def get_max_bandwidth(client_ip, bytes_wanted):
+def get_max_bandwidth(client_conn, bytes_wanted):
+    # Returns the max bandwidth available for the given client, defined as the
+    # number of tokens in the bucket, or the number of bytes requested by the
+    # client (whichever is smaller)
+
+    client_ip = client_IPS[client_conn]
+
     global limiter
-    curr_available = limiter._storage.get_token_count(client_ip)
+    # Tokens are only replenished when they are consumed, so for us to get an
+    # accurate reading on how many tokens are available, we must consume. The
+    # smallest amount we can consume is 1 token
+    limiter.consume(client_ip, 1)
+
+    # Add back what we consumed above
+    curr_available = limiter._storage.get_token_count(client_ip) + 1
     if VERBOSE: logging.debug("Getting min of (%f and %f - curr avail)" % (bytes_wanted, curr_available))
 
     return min(bytes_wanted, curr_available)
 
-def put_back_tokens(client_ip, num_tokens):
-    # TODO: implement
-    pass
+def set_token_quantity(client_conn, num_tokens):
+    # Sets the number of tokens of a given client to the number of tokens
+    # passed in
+
+    # This function works by manipulating how replenish is implemented, since
+    # there is no explicit way to set the number of tokens per bucket.
+    # replenish() sets the number of tokens to:
+    #   min(capacity, tokens_in_bucket + (rate * (now - last_replenished_at)))
+    # where capacity and rate are passed in as parameters. We aim to force
+    # replenish to always use the value for capacity that we pass in.
+
+    client_ip = client_IPS[client_conn]
+
+    if VERBOSE: logging.debug("Resetting token count for %s to %f" % (str(client_conn), num_tokens))
+    # Replenish with rate equivalent to infinity, which should force the capacity
+    # to be used. There's still a chance this could end up being lower if replenish
+    # was called recently (unless num_tokens is 0).
+    limiter._storage.replenish(client_ip, float('inf'), num_tokens)
+   
+    if limiter._storage.get_token_count(client_ip) != num_tokens:
+        if VERBOSE: logging.debug("ERROR: Token count should be %f but it's actually %f" %
+                (num_tokens, limiter._storage.get_token_count(client_ip)))
+
+def put_back_tokens(client_conn, num_tokens):
+    # Puts back num_tokens number of tokens for the given client
+
+    client_ip = client_IPS[client_conn]
+
+    if VERBOSE: logging.debug("Putting back %f tokens for client %s" % (num_tokens, str(client_conn)))
+    current_tokens = limiter._storage.get_token_count(client_ip)
+    set_token_quantity(client_conn, current_tokens + num_tokens)
+    if VERBOSE: logging.debug("Token count for client %s is now %f" % (
+        str(client_conn), limiter._storage.get_token_count(client_ip)))
 
 ###############################################################################
 #                      HTTP DATA STRUCTURE MANIPULATION                       #
