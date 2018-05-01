@@ -69,9 +69,11 @@ HTTP_client_req_info = dict()
 #   can hold. Once the bucket is full, additional tokens
 #   are discarded.
 
+# Rate limiting
+USING_RATE_LIMITING = False 
 # Rate and capacity units: bytes per second (per client)
-RATE = 1000000
-CAPACITY = 1500000
+RATE = None
+CAPACITY = None
 
 # Choosing the verbose option prints every debug statement. Otherwise,
 # only major ones are printed
@@ -117,9 +119,7 @@ def main():
     global HTTP_client_req_info
 
     while inputs:
-        #if VERBOSE: logging.debug("Num inputs: %d \n%s" % (len(inputs), str(inputs)))
         readable, _, _ = select.select(inputs, [], [])
-        #if VERBOSE: logging.debug("Num readable: %d" % len(readable))
 
         closed_sockets = []
 
@@ -152,7 +152,7 @@ def main():
                 try:
                     # We rate limit only on download, so we limit the amount of data the client
                     # can get from the server at a time
-                    if s == server_conn:
+                    if USING_RATE_LIMITING and s == server_conn:
                         bytes_to_read = int(get_max_bandwidth(client_conn, MAX_HEADER_BYTES))
                     else:
                         bytes_to_read = MAX_HEADER_BYTES
@@ -184,12 +184,9 @@ def main():
                     logging.debug( "********** Caught exception %s in main" % (str(sys.exc_info())))
                     if VERBOSE: logging.debug(traceback.print_tb(sys.exc_info()[2]))
 
-                if s == server_conn and len(data) > 0:
+                if USING_RATE_LIMITING and s == server_conn and len(data) > 0:
                     # Remove tokens based on how much was actually read
                     limiter.consume(client_IPS[client_conn], len(data))
-
-                # TODO: Wrap this whole thing in a try-catch and close the connection if
-                # an exception gets thrown
 
                 # handle the data
                 if data:
@@ -212,8 +209,6 @@ def main():
                         forward_bytes(s, data)       
                             
                 # cleanup
-                # TODO: Acquire and release HTTP server connection *per request*, not per client
-                # TODO: Move cleanup code to function, and run it on exception as well
                 else:
                     logging.debug("closing connections")
                     print_server_by_client_bidict()
@@ -230,11 +225,6 @@ def main():
                     # Stop listening for input on the connections
                     inputs.remove(client_conn)
                     inputs.remove(server_conn)
-
-                    #if VERBOSE: logging.debug("No longer listening on client %s and server %s" %
-                    #    (str(client_conn), str(server_conn)))
-                    #if VERBOSE: logging.debug("Just to confirm, this is what inputs looks like now:\n%s" %
-                    #    (str(inputs)))
 
                     # Close the connections
                     server_conn.close()
@@ -273,6 +263,10 @@ def handle_command_line_args():
     if args.burst_rate:
         CAPACITY = args.burst_rate
 
+    global USING_RATE_LIMITING
+    if args.burst_rate and args.bandwidth:
+        USING_RATE_LIMITING = True
+
     global MODIFY_CONTENT
     global CONTENT_REPLACE_TARGET
     if args.fahad_keyword:
@@ -281,8 +275,9 @@ def handle_command_line_args():
 
     global limiter
     global storage
-    storage = token_bucket.MemoryStorage()
-    limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
+    if USING_RATE_LIMITING:
+        storage = token_bucket.MemoryStorage()
+        limiter = token_bucket.Limiter(RATE, CAPACITY, storage)
 
     global USING_BLACKLIST
     if args.blacklist_sites is not None:
@@ -303,7 +298,7 @@ def create_master_socket(args):
     msock = socket(AF_INET, SOCK_STREAM)
     server_address = (args.server_address, args.port)
 
-    logging.debug('starting up on %s port %s, %s, rate=%d, burst=%d' % 
+    logging.debug('starting up on %s port %s, %s, rate=%s, burst=%s' % 
         (server_address[0], server_address[1],
         "verbose logging" if VERBOSE else "regular (nonverbose) logging",
         RATE, CAPACITY))
@@ -365,7 +360,8 @@ def accept_new_connection(msock):
                 if VERBOSE: logging.debug("Set up http connection: client %s server %s" % (
                     str(client_conn), str(server_conn)))
 
-            set_token_quantity(client_conn, 0)
+            if USING_RATE_LIMITING:
+                set_token_quantity(client_conn, 0)
             return [client_conn, server_conn]
 
     except error, v:
@@ -425,10 +421,6 @@ def setup_HTTP_connection(client_conn, request, raw_data):
     
     # debugging
     if VERBOSE: logging.debug("Request (raw data):\n%s" % raw_data)
-    if "Proxy-Connection" in request.headers:
-        if VERBOSE: logging.debug("proxy-connection was in the headers, with value %s" % request.headers["Proxy-Connection"])
-        #request.headers['Connection'] = request.headers['Proxy-Connection']
-        # logging.debug("Added Connection header to request head")
     if VERBOSE: logging.debug("Request path: %s" % request.path)
 
     # map between client and server connections
@@ -833,16 +825,6 @@ def set_token_quantity(client_conn, num_tokens):
         if VERBOSE: logging.debug("ERROR: Token count should be %f but it's actually %f" %
                 (num_tokens, limiter._storage.get_token_count(client_ip)))
 
-def put_back_tokens(client_conn, num_tokens):
-    # Puts back num_tokens number of tokens for the given client
-
-    client_ip = client_IPS[client_conn]
-
-    if VERBOSE: logging.debug("Putting back %f tokens for client %s" % (num_tokens, str(client_conn)))
-    current_tokens = limiter._storage.get_token_count(client_ip)
-    set_token_quantity(client_conn, current_tokens + num_tokens)
-    if VERBOSE: logging.debug("Token count for client %s is now %f" % (
-        str(client_conn), limiter._storage.get_token_count(client_ip)))
 
 ###############################################################################
 #                      HTTP DATA STRUCTURE MANIPULATION                       #
