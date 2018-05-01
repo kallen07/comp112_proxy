@@ -1,12 +1,38 @@
-# comp112_proxy
+# Comp 112 Proxy
 
 
-HTTPS bidict -> mapping between server and client sockets
+# Mechanics
 
-potential features to add:
-- blacklists for sites
-- hosting on a server so other people can try it out
-- content filtering for HTTP
+Please run the following commands to install packages
 
-Can integrate data read for HTTP and HTTPS so that we have the same code path for ratelimiting (consume the max number of tokens, put back what you didn't use - ie if the read wasn't big enough, then process that data, which will be different for http vs https)
+``pip install bidict``
 
+``pip install token-bucket``
+
+# Running our proxy:
+
+**Without any special features**
+
+``python proxy.py [port #]``
+
+**With very verbose logging**
+
+``python proxy.py -v [port #]``
+
+**Bind to a specific IP**
+
+``python proxy.py -a [IP address] [port #]``
+
+**Enable rate limiting**
+
+``python proxy.py --bandwidth=[value in bytes per second] --burst_rate=[value in bytes per second] [port #]``
+
+**Blacklist sites**
+
+``python proxy.py -b [filename] [port #]``
+
+Note: file should contain a list of newline separated hostnames
+
+**Content substitution**
+
+``python proxy.py --fahad_keyword=[5 letter word] [port #]``
