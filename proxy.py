@@ -430,7 +430,6 @@ def setup_HTTP_connection(client_conn, request, raw_data):
     HTTP_connections.add(server_conn)
 
     # send request to server
-    # send_HTTP_request_to_server(server_conn, request)
     forward_bytes(src_conn = client_conn, data = raw_data)
 
     return server_conn
